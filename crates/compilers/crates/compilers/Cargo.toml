@@ -41,6 +41,7 @@ winnow = "1.0.2"
 dyn-clone = "1.0.20"
 derive_more = { version = "2.1.1", features = ["debug"] }
 itertools = ">=0.13, <=0.15"
+fd-lock = "4.0.4"
 
 # project-util
 fs_extra = { workspace = true, optional = true }
@@ -53,7 +54,6 @@ sha2 = { version = "0.11.0", default-features = false, optional = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
-fd-lock = "4.0.4"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 reqwest.workspace = true
 tempfile.workspace = true

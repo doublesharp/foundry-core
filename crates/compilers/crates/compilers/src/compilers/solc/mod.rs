@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     SourceParser,
+    cache::compiler_output::CompilerOutputCache,
     resolver::{
         Node,
         parse::{SolData, SolParser},
@@ -25,6 +26,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 pub use foundry_compilers_artifacts::SolcLanguage;
@@ -40,7 +42,24 @@ pub enum SolcCompiler {
     #[cfg(feature = "svm-solc")]
     AutoDetect,
 
+    /// Auto-detect a compiler and configure it with a raw output cache.
+    #[cfg(feature = "svm-solc")]
+    AutoDetectWithCache(Arc<dyn CompilerOutputCache>),
+
     Specific(Solc),
+}
+
+impl SolcCompiler {
+    /// Configures a raw compiler-output cache.
+    pub fn set_compiler_output_cache(&mut self, cache: Arc<dyn CompilerOutputCache>) {
+        match self {
+            Self::Specific(solc) => solc.set_compiler_output_cache(cache),
+            #[cfg(feature = "svm-solc")]
+            Self::AutoDetect => *self = Self::AutoDetectWithCache(cache),
+            #[cfg(feature = "svm-solc")]
+            Self::AutoDetectWithCache(existing) => *existing = cache,
+        }
+    }
 }
 
 impl Language for SolcLanguage {
@@ -64,6 +83,12 @@ impl Compiler for SolcCompiler {
 
             #[cfg(feature = "svm-solc")]
             Self::AutoDetect => Solc::find_or_install(&input.version)?,
+            #[cfg(feature = "svm-solc")]
+            Self::AutoDetectWithCache(cache) => {
+                let mut solc = Solc::find_or_install(&input.version)?;
+                solc.set_compiler_output_cache(cache.clone());
+                solc
+            }
         };
         solc.base_path.clone_from(&input.cli_settings.base_path);
         solc.allow_paths.clone_from(&input.cli_settings.allow_paths);
@@ -83,7 +108,7 @@ impl Compiler for SolcCompiler {
             ))],
 
             #[cfg(feature = "svm-solc")]
-            Self::AutoDetect => {
+            Self::AutoDetect | Self::AutoDetectWithCache(_) => {
                 let mut all_versions = Solc::installed_versions()
                     .into_iter()
                     .map(CompilerVersion::Installed)
@@ -638,11 +663,13 @@ mod tests {
     use std::{
         collections::BTreeMap,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use crate::{
         AggregatedCompilerOutput,
         buildinfo::RawBuildInfo,
+        cache::compiler_output::LocalCompilerOutputCache,
         compilers::{
             CompilerInput,
             solc::{SolcCompiler, SolcSettings, SolcVersionedInput},
@@ -653,6 +680,15 @@ mod tests {
 
     fn solc() -> Solc {
         Solc::new("solc").unwrap_or_else(|_| Solc::new_with_version("solc", Version::new(0, 8, 26)))
+    }
+
+    #[cfg(feature = "svm-solc")]
+    #[test]
+    fn auto_detect_retains_configured_compiler_output_cache() {
+        let mut compiler = SolcCompiler::AutoDetect;
+        compiler.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new("cache")));
+
+        assert!(matches!(compiler, SolcCompiler::AutoDetectWithCache(_)));
     }
 
     #[test]

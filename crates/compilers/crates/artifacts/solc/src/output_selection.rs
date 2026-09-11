@@ -6,6 +6,8 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 /// Represents the desired outputs based on a File `(file -> (contract -> [outputs]))`
 pub type FileOutputSelection = BTreeMap<String, Vec<String>>;
 
+const WILDCARD_EXPERIMENTAL_OUTPUTS: [&str; 4] = ["ir", "irAst", "irOptimized", "irOptimizedAst"];
+
 /// Represents the selected output of files and contracts.
 ///
 /// The first level key is the file name and the second level key is the
@@ -146,17 +148,75 @@ impl OutputSelection {
     }
 
     /// Returns true if this output selection is a subset of the other output selection.
-    // TODO: correctly process wildcard keys to reduce false negatives
     pub fn is_subset_of(&self, other: &Self) -> bool {
-        self.0.iter().all(|(file, selection)| {
-            other.0.get(file).is_some_and(|other_selection| {
+        self == other
+            || self.0.iter().all(|(file, selection)| {
                 selection.iter().all(|(contract, outputs)| {
-                    other_selection.get(contract).is_some_and(|other_outputs| {
-                        outputs.iter().all(|output| other_outputs.contains(output))
+                    outputs.iter().all(|output| {
+                        Self::matching_file_selections(&other.0, file)
+                            .flat_map(|selection| {
+                                Self::matching_contract_outputs(selection, contract)
+                            })
+                            .any(|cached_outputs| Self::output_is_selected(cached_outputs, output))
                     })
                 })
             })
-        })
+    }
+
+    /// Returns the cached file selections which cover `file`.
+    ///
+    /// Solc checks the exact file selector before the wildcard selector. Both are additive: a
+    /// matching output in either selector is requested.
+    fn matching_file_selections<'a>(
+        selections: &'a BTreeMap<String, FileOutputSelection>,
+        file: &str,
+    ) -> impl Iterator<Item = &'a FileOutputSelection> {
+        [Some(file), (file != "*").then_some("*")]
+            .into_iter()
+            .flatten()
+            .filter_map(|file| selections.get(file))
+    }
+
+    /// Returns the cached contract selections which cover `contract`.
+    ///
+    /// The empty contract name is a file-level selector, so solc does not fall back to `*` for
+    /// it. A requested contract wildcard, on the other hand, can only be covered by a cached
+    /// contract wildcard.
+    fn matching_contract_outputs<'a>(
+        selection: &'a FileOutputSelection,
+        contract: &str,
+    ) -> impl Iterator<Item = &'a Vec<String>> {
+        let contracts = match contract {
+            "" => [Some(""), None],
+            "*" => [Some("*"), None],
+            contract => [Some(contract), Some("*")],
+        };
+        contracts.into_iter().flatten().filter_map(|contract| selection.get(contract))
+    }
+
+    /// Returns whether an output selector requests `output` according to solc's standard-json
+    /// matching rules.
+    fn output_is_selected(outputs: &[String], output: &str) -> bool {
+        let requires_exact_match = output.contains("ethdebug");
+
+        for selected in outputs {
+            if selected == output {
+                return true;
+            }
+            if selected == "*" {
+                if requires_exact_match || output == "yulCFGJson" {
+                    return false;
+                }
+                if WILDCARD_EXPERIMENTAL_OUTPUTS.contains(&output) {
+                    continue;
+                }
+                return true;
+            }
+            if output.strip_prefix(selected).is_some_and(|suffix| suffix.starts_with('.')) {
+                return !requires_exact_match;
+            }
+        }
+        false
     }
 
     /// Returns true if AST output is requested.
@@ -694,6 +754,256 @@ mod tests {
         )]));
 
         assert!(!output_selection_specific.is_subset_of(&output_selection));
+    }
+
+    #[test]
+    fn outputselection_subset_of_itself_with_order_sensitive_outputs() {
+        for outputs in [
+            ["*", "yulCFGJson"],
+            ["*", "evm.bytecode.ethdebug"],
+            ["evm.bytecode", "evm.bytecode.ethdebug"],
+        ] {
+            let selection =
+                OutputSelection::empty().with_output("*", "*", outputs.map(str::to_string));
+
+            assert!(selection.is_subset_of(&selection), "{outputs:?}");
+        }
+    }
+
+    #[test]
+    fn outputselection_subset_of_matches_solc_wildcards() {
+        let selection = |entries: &[(&str, &str, &[&str])]| {
+            entries.iter().fold(OutputSelection::empty(), |selection, (file, contract, outputs)| {
+                selection.with_output(
+                    *file,
+                    *contract,
+                    outputs.iter().map(|output| (*output).to_string()),
+                )
+            })
+        };
+
+        let cases = [
+            (
+                "exact selector is covered by file and contract wildcards",
+                selection(&[("A.sol", "A", &["abi"])]),
+                selection(&[("*", "*", &["abi"])]),
+                true,
+            ),
+            (
+                "exact selector combines exact and wildcard matches",
+                selection(&[("A.sol", "A", &["abi", "metadata"])]),
+                selection(&[("A.sol", "A", &["abi"]), ("*", "*", &["metadata"])]),
+                true,
+            ),
+            (
+                "exact file with all contracts is covered by an exact file wildcard contract",
+                selection(&[("A.sol", "*", &["abi"])]),
+                selection(&[("A.sol", "*", &["abi"])]),
+                true,
+            ),
+            (
+                "all files for an exact contract require a file wildcard",
+                selection(&[("*", "A", &["abi"])]),
+                selection(&[("*", "A", &["abi"])]),
+                true,
+            ),
+            (
+                "wildcard output covers an exact output",
+                selection(&[("A.sol", "A", &["abi"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                true,
+            ),
+            (
+                "parent output covers a nested output",
+                selection(&[("A.sol", "A", &["evm.bytecode.object"])]),
+                selection(&[("A.sol", "A", &["evm.bytecode"])]),
+                true,
+            ),
+            (
+                "file-level selector uses the empty contract name",
+                selection(&[("A.sol", "", &["ast"])]),
+                selection(&[("*", "", &["ast"])]),
+                true,
+            ),
+            (
+                "wildcard contract does not cover file-level output",
+                selection(&[("A.sol", "", &["ast"])]),
+                selection(&[("A.sol", "*", &["ast"])]),
+                false,
+            ),
+            (
+                "exact contract does not cover a different contract",
+                selection(&[("A.sol", "B", &["abi"])]),
+                selection(&[("A.sol", "A", &["abi"])]),
+                false,
+            ),
+            (
+                "exact file does not cover every file",
+                selection(&[("*", "*", &["abi"])]),
+                selection(&[("A.sol", "*", &["abi"])]),
+                false,
+            ),
+            (
+                "exact output does not cover a wildcard output request",
+                selection(&[("A.sol", "A", &["*"])]),
+                selection(&[("A.sol", "A", &["abi"])]),
+                false,
+            ),
+            (
+                "nested output does not cover its parent output",
+                selection(&[("A.sol", "A", &["evm.bytecode"])]),
+                selection(&[("A.sol", "A", &["evm.bytecode.object"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover ir",
+                selection(&[("A.sol", "A", &["ir"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover ir ast",
+                selection(&[("A.sol", "A", &["irAst"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover optimized ir",
+                selection(&[("A.sol", "A", &["irOptimized"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover optimized ir ast",
+                selection(&[("A.sol", "A", &["irOptimizedAst"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover yul cfg json",
+                selection(&[("A.sol", "A", &["yulCFGJson"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "wildcard output does not cover ethdebug",
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                selection(&[("A.sol", "A", &["*"])]),
+                false,
+            ),
+            (
+                "ethdebug parent output does not cover ethdebug child",
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                selection(&[("A.sol", "A", &["evm.bytecode"])]),
+                false,
+            ),
+            (
+                "exact ir output covers ir",
+                selection(&[("A.sol", "A", &["ir"])]),
+                selection(&[("A.sol", "A", &["ir"])]),
+                true,
+            ),
+            (
+                "exact yul cfg json output covers yul cfg json",
+                selection(&[("A.sol", "A", &["yulCFGJson"])]),
+                selection(&[("A.sol", "A", &["yulCFGJson"])]),
+                true,
+            ),
+            (
+                "exact ethdebug output covers ethdebug",
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                true,
+            ),
+            (
+                "wildcard before exact ir covers ir",
+                selection(&[("A.sol", "A", &["ir"])]),
+                selection(&[("A.sol", "A", &["*", "ir"])]),
+                true,
+            ),
+            (
+                "wildcard before exact ir ast covers ir ast",
+                selection(&[("A.sol", "A", &["irAst"])]),
+                selection(&[("A.sol", "A", &["*", "irAst"])]),
+                true,
+            ),
+            (
+                "wildcard before exact optimized ir covers optimized ir",
+                selection(&[("A.sol", "A", &["irOptimized"])]),
+                selection(&[("A.sol", "A", &["*", "irOptimized"])]),
+                true,
+            ),
+            (
+                "wildcard before exact optimized ir ast covers optimized ir ast",
+                selection(&[("A.sol", "A", &["irOptimizedAst"])]),
+                selection(&[("A.sol", "A", &["*", "irOptimizedAst"])]),
+                true,
+            ),
+            (
+                "exact ir before wildcard covers ir",
+                selection(&[("A.sol", "A", &["ir"])]),
+                selection(&[("A.sol", "A", &["ir", "*"])]),
+                true,
+            ),
+            (
+                "wildcard before exact yul cfg json does not cover yul cfg json",
+                selection(&[("A.sol", "A", &["yulCFGJson"])]),
+                selection(&[("A.sol", "A", &["*", "yulCFGJson"])]),
+                false,
+            ),
+            (
+                "wildcard before exact ethdebug does not cover ethdebug",
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                selection(&[("A.sol", "A", &["*", "evm.bytecode.ethdebug"])]),
+                false,
+            ),
+            (
+                "parent before exact ethdebug does not cover ethdebug",
+                selection(&[("A.sol", "A", &["evm.bytecode.ethdebug"])]),
+                selection(&[("A.sol", "A", &["evm.bytecode", "evm.bytecode.ethdebug"])]),
+                false,
+            ),
+            (
+                "dotted boundary prevents partial parent matches",
+                selection(&[("A.sol", "A", &["evm.bytecode.object"])]),
+                selection(&[("A.sol", "A", &["evm.byte"])]),
+                false,
+            ),
+            (
+                "dotted boundary prevents suffix parent matches",
+                selection(&[("A.sol", "A", &["evm.bytecode.object"])]),
+                selection(&[("A.sol", "A", &["evm.bytecodeX"])]),
+                false,
+            ),
+            (
+                "empty request is covered",
+                selection(&[("A.sol", "A", &[])]),
+                selection(&[("A.sol", "A", &[])]),
+                true,
+            ),
+            (
+                "duplicate output selectors remain covered",
+                selection(&[("A.sol", "A", &["abi", "abi"])]),
+                selection(&[("A.sol", "A", &["abi", "abi"])]),
+                true,
+            ),
+            (
+                "custom output parent covers custom child",
+                selection(&[("A.sol", "A", &["custom.output"])]),
+                selection(&[("A.sol", "A", &["custom"])]),
+                true,
+            ),
+            (
+                "custom output sibling does not cover custom child",
+                selection(&[("A.sol", "A", &["custom.output"])]),
+                selection(&[("A.sol", "A", &["custom.other"])]),
+                false,
+            ),
+        ];
+
+        for (name, requested, cached, expected) in cases {
+            assert_eq!(requested.is_subset_of(&cached), expected, "{name}");
+        }
     }
 
     #[test]

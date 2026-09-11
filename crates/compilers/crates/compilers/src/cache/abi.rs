@@ -19,9 +19,16 @@ use tempfile::{Builder, TempDir};
 /// Holds the store lock across snapshot loading, compilation, publication, and collection.
 /// The lock file is outside the store so collection cannot replace its identity.
 pub(crate) struct AbiCache {
-    _lock: fs::File,
+    lock: fs::File,
     root: PathBuf,
     directory: PathBuf,
+}
+
+impl Drop for AbiCache {
+    fn drop(&mut self) {
+        // A concurrent compiler spawn may inherit the descriptor before exec closes it.
+        let _ = self.lock.unlock();
+    }
 }
 
 impl AbiCache {
@@ -42,7 +49,7 @@ impl AbiCache {
         };
         // Contention is a cache miss, not a reason to stall a compiler invocation.
         lock.try_lock().map_err(io::Error::other)?;
-        Ok(Self { _lock: lock, root, directory })
+        Ok(Self { lock, root, directory })
     }
 
     pub(crate) fn paths<L>(&self, logical: &ProjectPathsConfig<L>) -> Box<ProjectPathsConfig<L>>
@@ -199,5 +206,24 @@ impl AbiCache {
                 Self::collect_generations(&directory, &current);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_drop_releases_lock_with_inherited_file_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("abi");
+        let context = root.join("default");
+        let cache = AbiCache::open(root.clone(), context.clone(), true).unwrap();
+        let inherited = cache.lock.try_clone().unwrap();
+        drop(cache);
+
+        let reopened = AbiCache::open(root, context, true);
+        assert!(reopened.is_ok(), "cache lock remained held: {:?}", reopened.err());
+        drop(inherited);
     }
 }

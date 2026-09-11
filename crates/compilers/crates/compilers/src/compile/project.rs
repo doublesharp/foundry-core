@@ -179,6 +179,8 @@ impl<'a, T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
         if let Some(filter) = &project.sparse_output {
             sources.retain(|f, _| filter.is_match(f))
         }
+        #[cfg(feature = "test-utils")]
+        crate::cache::test_utils::record_graph_resolution(&project.paths.root);
         let graph = Graph::resolve_sources(&project.paths, sources)?;
         let ResolvedSources { sources, primary_profiles, edges } =
             graph.into_sources_by_version(project)?;
@@ -236,11 +238,13 @@ impl<'a, T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
         trace!("preprocessing");
         let Self { edges, project, mut sources, primary_profiles, preprocessor } = self;
 
+        let cache_sources = sources.all_sources();
+
         // convert paths on windows to ensure consistency with the `CompilerOutput` `solc` emits,
         // which is unix style `/`
         sources.slash_paths();
 
-        let mut cache = ArtifactsCache::new(project, edges, preprocessor.is_some())?;
+        let mut cache = ArtifactsCache::new(project, edges, cache_sources, preprocessor.is_some())?;
         // retain and compile only dirty sources and all their imports
         sources.filter(&mut cache);
 
@@ -268,6 +272,7 @@ impl<'a, C: Compiler<CompilerContract = Contract>> ProjectCompiler<'a, Configura
         }
         let slash_paths = project.slash_paths;
         let preprocessed = self.preprocessor.is_some();
+        let cache_sources = self.sources.all_sources();
         let state = self.preprocess()?;
         let mut output = if !project.cached
             || state.sources.sources.values().flatten().all(|(_, sources, _)| sources.is_empty())
@@ -326,6 +331,7 @@ impl<'a, C: Compiler<CompilerContract = Contract>> ProjectCompiler<'a, Configura
             let mut cache = ArtifactsCache::with_storage(
                 project,
                 edges,
+                cache_sources,
                 preprocessed,
                 Some(store.paths(&project.paths)),
             )?;
@@ -674,6 +680,17 @@ impl<L: Language, S: CompilerSettings> CompilerSources<'_, L, S> {
                 );
             }
         }
+    }
+
+    /// Returns the complete graph source set without rereading it from disk.
+    fn all_sources(&self) -> Sources {
+        self.sources
+            .values()
+            .flat_map(|versioned_sources| versioned_sources.iter())
+            .flat_map(|(_, sources, _)| {
+                sources.iter().map(|(path, source)| (path.clone(), source.clone()))
+            })
+            .collect()
     }
 
     /// Compiles all the files with `Solc`

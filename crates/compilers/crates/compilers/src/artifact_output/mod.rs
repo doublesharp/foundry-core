@@ -13,6 +13,7 @@ use foundry_compilers_core::{
     utils::{self, strip_prefix_owned},
 };
 use path_slash::PathBufExt;
+use rayon::prelude::*;
 use semver::Version;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -207,13 +208,10 @@ impl<T> Deref for Artifacts<T> {
     }
 }
 
-impl<T: Serialize> Artifacts<T> {
+impl<T: Serialize + Sync> Artifacts<T> {
     /// Writes all artifacts into the given `artifacts_root` folder
     pub fn write_all(&self) -> Result<()> {
-        for artifact in self.artifact_files() {
-            artifact.write()?;
-        }
-        Ok(())
+        self.artifact_files().par_bridge().try_for_each(ArtifactFile::write)
     }
 }
 
@@ -1029,6 +1027,11 @@ pub trait ArtifactOutput {
         Ok(false)
     }
 
+    /// Whether cached artifacts need checking before reuse.
+    fn requires_extra_output_check(&self) -> bool {
+        true
+    }
+
     /// Invoked with all artifacts that were not recompiled.
     fn handle_cached_artifacts(&self, _artifacts: &Artifacts<Self::Artifact>) -> Result<()> {
         Ok(())
@@ -1123,6 +1126,10 @@ impl ArtifactOutput for MinimalCombinedArtifacts {
     ) -> Option<Self::Artifact> {
         None
     }
+
+    fn requires_extra_output_check(&self) -> bool {
+        false
+    }
 }
 
 /// An Artifacts handler implementation that works the same as `MinimalCombinedArtifacts` but also
@@ -1184,11 +1191,98 @@ impl ArtifactOutput for MinimalCombinedArtifactsHardhatFallback {
     ) -> Option<Self::Artifact> {
         MinimalCombinedArtifacts::default().standalone_source_file_to_artifact(path, file)
     }
+
+    fn requires_extra_output_check(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serializer;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    #[derive(Clone)]
+    struct SerializationTracker {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    struct ActiveSerialization<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveSerialization<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedArtifact {
+        tracker: SerializationTracker,
+        payload: String,
+    }
+
+    impl Serialize for TrackedArtifact {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let active = self.tracker.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.tracker.maximum.fetch_max(active, Ordering::SeqCst);
+            let _active = ActiveSerialization(&self.tracker.active);
+            thread::sleep(Duration::from_millis(25));
+            self.payload.serialize(serializer)
+        }
+    }
+
+    #[test]
+    fn writes_artifacts_in_parallel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tracker = SerializationTracker {
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut artifacts = ArtifactsMap::new();
+        let mut files = Vec::new();
+
+        for index in 0..8 {
+            let file = tmp.path().join(format!("Contract{index}.json"));
+            files.push(file.clone());
+            artifacts
+                .entry(PathBuf::from(format!("src/Contract{index}.sol")))
+                .or_default()
+                .entry(format!("Contract{index}"))
+                .or_default()
+                .push(ArtifactFile {
+                    artifact: TrackedArtifact {
+                        tracker: tracker.clone(),
+                        payload: "x".repeat(128 * 1024),
+                    },
+                    file,
+                    version: Version::new(0, 8, 35),
+                    build_id: "default".to_string(),
+                    profile: "default".to_string(),
+                });
+        }
+
+        let artifacts = Artifacts::from(artifacts);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| artifacts.write_all())
+            .unwrap();
+
+        assert!(files.into_iter().all(|file| file.is_file()));
+        assert!(tracker.maximum.load(Ordering::SeqCst) > 1, "artifact serializers must overlap");
+    }
 
     #[test]
     fn is_artifact() {

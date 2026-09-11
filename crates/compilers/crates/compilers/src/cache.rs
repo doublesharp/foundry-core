@@ -1,8 +1,8 @@
 //! Support for compiling contracts.
 
 use crate::{
-    ArtifactFile, ArtifactOutput, Artifacts, ArtifactsMap, Graph, OutputContext, Project,
-    ProjectPaths, ProjectPathsConfig, SourceCompilationKind, SourceParser,
+    ArtifactFile, ArtifactOutput, Artifacts, ArtifactsMap, OutputContext, Project, ProjectPaths,
+    ProjectPathsConfig, SourceCompilationKind, SourceParser,
     buildinfo::RawBuildInfo,
     compilers::{Compiler, CompilerSettings, Language},
     output::Builds,
@@ -27,8 +27,93 @@ use std::{
 
 pub(crate) mod abi;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{
+            Mutex, MutexGuard, RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct CacheIoCounters {
+        pub graph_resolutions: usize,
+        pub artifact_deserializations: usize,
+        pub build_info_deserializations: usize,
+        pub extra_output_scans: usize,
+    }
+
+    static GRAPH_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+    static ARTIFACT_DESERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+    static BUILD_INFO_DESERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
+    static EXTRA_OUTPUT_SCANS: AtomicUsize = AtomicUsize::new(0);
+    static CACHE_IO_LOCK: Mutex<()> = Mutex::new(());
+    static ACTIVE_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+    pub struct CacheIoMeasurement {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for CacheIoMeasurement {
+        fn drop(&mut self) {
+            *ACTIVE_ROOT.write().unwrap() = None;
+        }
+    }
+
+    pub fn start_cache_io_measurement(root: impl Into<PathBuf>) -> CacheIoMeasurement {
+        let guard = CACHE_IO_LOCK.lock().unwrap();
+        *ACTIVE_ROOT.write().unwrap() = Some(root.into());
+        GRAPH_RESOLUTIONS.store(0, Ordering::Relaxed);
+        ARTIFACT_DESERIALIZATIONS.store(0, Ordering::Relaxed);
+        BUILD_INFO_DESERIALIZATIONS.store(0, Ordering::Relaxed);
+        EXTRA_OUTPUT_SCANS.store(0, Ordering::Relaxed);
+        CacheIoMeasurement { _guard: guard }
+    }
+
+    pub fn cache_io_counters() -> CacheIoCounters {
+        CacheIoCounters {
+            graph_resolutions: GRAPH_RESOLUTIONS.load(Ordering::Relaxed),
+            artifact_deserializations: ARTIFACT_DESERIALIZATIONS.load(Ordering::Relaxed),
+            build_info_deserializations: BUILD_INFO_DESERIALIZATIONS.load(Ordering::Relaxed),
+            extra_output_scans: EXTRA_OUTPUT_SCANS.load(Ordering::Relaxed),
+        }
+    }
+
+    fn is_measured(path: &Path) -> bool {
+        ACTIVE_ROOT.read().unwrap().as_deref().is_some_and(|root| path.starts_with(root))
+    }
+
+    pub(crate) fn record_graph_resolution(path: &Path) {
+        if is_measured(path) {
+            GRAPH_RESOLUTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_artifact_deserialization(path: &Path) {
+        if is_measured(path) {
+            ARTIFACT_DESERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_build_info_deserialization(path: &Path) {
+        if is_measured(path) {
+            BUILD_INFO_DESERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_extra_output_scan(path: &Path) {
+        if is_measured(path) {
+            EXTRA_OUTPUT_SCANS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 mod iface;
 use iface::{interface_repr_hash, interface_repr_hash_compiler};
+
+pub mod compiler_output;
 
 /// ethers-rs format version
 ///
@@ -361,13 +446,24 @@ impl<S: CompilerSettings> CompilerCache<S> {
     /// [BuildContext]: crate::buildinfo::BuildContext
     #[instrument(skip_all)]
     pub fn read_builds<L: Language>(&self, build_info_dir: &Path) -> Result<Builds<L>> {
+        self.read_builds_filtered(build_info_dir, |_| true)
+    }
+
+    fn read_builds_filtered<L, F>(&self, build_info_dir: &Path, filter: F) -> Result<Builds<L>>
+    where
+        L: Language,
+        F: Fn(&str) -> bool + Send + Sync,
+    {
         use rayon::prelude::*;
 
         self.builds
             .par_iter()
+            .filter(|build_id| filter(build_id))
             .map(|build_id| {
-                utils::read_json_file(&build_info_dir.join(build_id).with_extension("json"))
-                    .map(|b| (build_id.clone(), b))
+                let path = build_info_dir.join(build_id).with_extension("json");
+                #[cfg(feature = "test-utils")]
+                test_utils::record_build_info_deserialization(&path);
+                utils::read_json_file(&path).map(|b| (build_id.clone(), b))
             })
             .collect::<Result<_>>()
             .map(|b| Builds(b))
@@ -525,6 +621,8 @@ impl CacheEntry {
             let mut files = Vec::with_capacity(versioned_files.len());
             for (version, cached_artifact) in versioned_files {
                 for (profile, cached_artifact) in cached_artifact {
+                    #[cfg(feature = "test-utils")]
+                    test_utils::record_artifact_deserialization(&cached_artifact.path);
                     let artifact: Artifact = utils::read_json_file(&cached_artifact.path)?;
                     files.push(ArtifactFile {
                         artifact,
@@ -672,6 +770,9 @@ pub(crate) struct ArtifactsCacheInner<
     /// All already existing build infos.
     pub cached_builds: Builds<C::Language>,
 
+    /// Sources from the graph currently being compiled.
+    pub sources: Sources,
+
     /// Relationship between all the files.
     pub edges: GraphEdges<C::Parser>,
 
@@ -695,6 +796,9 @@ pub(crate) struct ArtifactsCacheInner<
 
     /// The interface representations for source files.
     pub interface_repr_hashes: HashMap<PathBuf, String>,
+
+    /// Whether any candidate artifact is missing a requested extra output file.
+    pub missing_extra_files: Option<bool>,
 }
 
 impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
@@ -829,14 +933,14 @@ impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
     }
 
     /// Returns whether we are missing artifacts for the given file and version.
-    fn is_missing_artifacts(&self, file: &Path, version: &Version, profile: &str) -> bool {
+    fn is_missing_artifacts(&mut self, file: &Path, version: &Version, profile: &str) -> bool {
         self.is_missing_artifacts_impl(file, version, profile).is_err()
     }
 
     /// Returns whether we are missing artifacts for the given file and version.
     #[instrument(level = "trace", name = "is_missing_artifacts", skip(self), ret)]
     fn is_missing_artifacts_impl(
-        &self,
+        &mut self,
         file: &Path,
         version: &Version,
         profile: &str,
@@ -889,76 +993,134 @@ impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
             }
         }
 
-        self.update_profiles();
-
-        // Iterate over existing cache entries.
-        let files = self.cache.files.keys().cloned().collect::<HashSet<_>>();
-
-        let mut sources = Sources::new();
-
-        // Read all sources, marking entries as dirty on I/O errors.
-        for file in &files {
-            let Ok(source) = Source::read(file) else {
-                self.dirty_sources.insert(file.clone());
-                continue;
-            };
-            sources.insert(file.clone(), source);
-        }
-
-        // Build a temporary graph for walking imports. We need this because `self.edges`
-        // only contains graph data for in-scope sources but we are operating on cache entries.
-        if let Ok(graph) = Graph::<C::Parser>::resolve_sources(&self.project.paths, sources) {
-            let (sources, edges) = graph.into_sources();
-
-            // Calculate content hashes for later comparison.
-            self.fill_hashes(&sources, edges.parser());
-
-            // Pre-add all sources that are guaranteed to be dirty
-            for file in sources.keys() {
-                if self.is_dirty(file, false) {
-                    self.dirty_sources.insert(file.clone());
+        fn populate_cached_dirty_files(
+            file: &Path,
+            dirty_files: &mut HashSet<PathBuf>,
+            importers: &HashMap<PathBuf, Vec<PathBuf>>,
+        ) {
+            if let Some(cached_importers) = importers.get(file) {
+                for importer in cached_importers {
+                    if dirty_files.insert(importer.clone()) {
+                        populate_cached_dirty_files(importer, dirty_files, importers);
+                    }
                 }
             }
+        }
 
-            if self.cache.preprocessed {
-                // Mark sources as dirty based on their imports
-                for file in sources.keys() {
+        self.update_profiles();
+
+        let sources = self.sources.clone();
+
+        // Calculate content hashes from the sources read while resolving the current graph.
+        let parser = self.edges.parser().clone();
+        self.fill_hashes(&sources, &parser);
+
+        // Pre-add all sources that are guaranteed to be dirty.
+        for file in sources.keys() {
+            if self.is_dirty(file, false) {
+                self.dirty_sources.insert(file.clone());
+            }
+        }
+
+        if self.cache.preprocessed {
+            // Mark sources as dirty based on their imports.
+            for file in sources.keys() {
+                if self.dirty_sources.contains(file) {
+                    continue;
+                }
+                let is_src = self.is_source_file(file);
+                for import in self.edges.imports(file) {
+                    // Any source file importing dirty source file is dirty.
+                    if is_src && self.dirty_sources.contains(import) {
+                        self.dirty_sources.insert(file.clone());
+                        break;
+                    // For non-src files we mark them as dirty only if they import dirty
+                    // non-src file or src file for which interface representation changed.
+                    // For identified mock contracts (non-src contracts that extends contracts
+                    // from src file) we mark edges as dirty.
+                    } else if !is_src
+                        && self.dirty_sources.contains(import)
+                        && (!self.is_source_file(import)
+                            || self.is_dirty(import, true)
+                            || self.cache.mocks.contains(file))
+                    {
+                        if self.cache.mocks.contains(file) {
+                            // Mark all mock edges as dirty.
+                            populate_dirty_files(file, &mut self.dirty_sources, &self.edges);
+                        }
+                        self.dirty_sources.insert(file.clone());
+                    }
+                }
+            }
+        } else {
+            // Perform DFS to find direct/indirect importers of dirty files.
+            for file in &self.dirty_sources.clone() {
+                populate_dirty_files(file, &mut self.dirty_sources, &self.edges);
+            }
+        }
+
+        // Current graph edges do not include importers omitted by a partial or sparse build.
+        // Reuse their cached imports to invalidate only those entries when an in-scope dependency
+        // is dirty, without rereading source files or resolving another graph.
+        let cached_imports = self
+            .cache
+            .files
+            .iter()
+            .map(|(file, entry)| {
+                (
+                    file.clone(),
+                    entry
+                        .imports
+                        .iter()
+                        .map(|import| self.project.root().join(import))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cached_importers = cached_imports.iter().fold(
+            HashMap::<PathBuf, Vec<PathBuf>>::new(),
+            |mut importers, (file, imports)| {
+                for import in imports {
+                    importers.entry(import.clone()).or_default().push(file.clone());
+                }
+                importers
+            },
+        );
+
+        if self.cache.preprocessed {
+            let mocks = self.cache.mocks.clone();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (file, imports) in &cached_imports {
                     if self.dirty_sources.contains(file) {
                         continue;
                     }
                     let is_src = self.is_source_file(file);
-                    for import in edges.imports(file) {
-                        // Any source file importing dirty source file is dirty.
-                        if is_src && self.dirty_sources.contains(import) {
-                            self.dirty_sources.insert(file.clone());
-                            break;
-                        // For non-src files we mark them as dirty only if they import dirty
-                        // non-src file or src file for which interface representation changed.
-                        // For identified mock contracts (non-src contracts that extends contracts
-                        // from src file) we mark edges as dirty.
-                        } else if !is_src
-                            && self.dirty_sources.contains(import)
-                            && (!self.is_source_file(import)
+                    for import in imports {
+                        if self.dirty_sources.contains(import)
+                            && (is_src
+                                || !self.is_source_file(import)
                                 || self.is_dirty(import, true)
-                                || self.cache.mocks.contains(file))
+                                || mocks.contains(file))
                         {
-                            if self.cache.mocks.contains(file) {
-                                // Mark all mock edges as dirty.
-                                populate_dirty_files(file, &mut self.dirty_sources, &edges);
+                            if mocks.contains(file) {
+                                populate_cached_dirty_files(
+                                    file,
+                                    &mut self.dirty_sources,
+                                    &cached_importers,
+                                );
                             }
-                            self.dirty_sources.insert(file.clone());
+                            changed = self.dirty_sources.insert(file.clone()) || changed;
+                            break;
                         }
                     }
                 }
-            } else {
-                // Perform DFS to find direct/indirect importers of dirty files.
-                for file in &self.dirty_sources.clone() {
-                    populate_dirty_files(file, &mut self.dirty_sources, &edges);
-                }
             }
         } else {
-            // Purge all sources on graph resolution error.
-            self.dirty_sources.extend(files);
+            for file in &self.dirty_sources.clone() {
+                populate_cached_dirty_files(file, &mut self.dirty_sources, &cached_importers);
+            }
         }
 
         // Remove all dirty files from cache.
@@ -966,6 +1128,41 @@ impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
             debug!("removing dirty file from cache: {}", file.display());
             self.cache.remove(file);
         }
+
+        self.load_cached_artifacts();
+    }
+
+    /// Loads only the clean entries that can be reused by the current compilation.
+    fn load_cached_artifacts(&mut self) {
+        let storage = self.storage_paths.as_deref().unwrap_or(&self.project.paths);
+        if !storage.artifacts.exists() {
+            return;
+        }
+
+        let in_scope = self.sources.keys().cloned().collect::<HashSet<_>>();
+        self.cached_artifacts = self
+            .cache
+            .read_artifacts_filtered::<T::Artifact, _>(|file| in_scope.contains(file))
+            .unwrap_or_default();
+
+        let build_ids = self
+            .cached_artifacts
+            .artifact_files()
+            .map(|artifact| artifact.build_id.clone())
+            .collect::<HashSet<_>>();
+        self.cached_builds = self
+            .cache
+            .read_builds_filtered(&storage.build_infos, |build_id| build_ids.contains(build_id))
+            .unwrap_or_default();
+
+        // Remove artifacts for which we are missing a build info.
+        self.cached_artifacts.0.retain(|_, artifacts| {
+            artifacts.retain(|_, artifacts| {
+                artifacts.retain(|artifact| self.cached_builds.contains_key(&artifact.build_id));
+                !artifacts.is_empty()
+            });
+            !artifacts.is_empty()
+        });
     }
 
     /// Updates the profiles in the cache, removing those which are dirty alongside their artifacts.
@@ -1059,17 +1256,25 @@ impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
     }
 
     /// Helper function to check if any requested extra files are missing for any artifact.
-    fn missing_extra_files(&self) -> bool {
-        for artifacts in self.cached_artifacts.values() {
-            for artifacts in artifacts.values() {
-                for artifact_file in artifacts {
-                    if self.project.artifacts_handler().is_dirty(artifact_file).unwrap_or(true) {
-                        return true;
-                    }
-                }
-            }
+    fn missing_extra_files(&mut self) -> bool {
+        if !self.project.artifacts_handler().requires_extra_output_check() {
+            return false;
         }
-        false
+
+        if let Some(missing_extra_files) = self.missing_extra_files {
+            return missing_extra_files;
+        }
+
+        #[cfg(feature = "test-utils")]
+        test_utils::record_extra_output_scan(&self.project.paths.root);
+        let missing_extra_files =
+            self.cached_artifacts.values().flat_map(|artifacts| artifacts.values()).flatten().any(
+                |artifact_file| {
+                    self.project.artifacts_handler().is_dirty(artifact_file).unwrap_or(true)
+                },
+            );
+        self.missing_extra_files = Some(missing_extra_files);
+        missing_extra_files
     }
 }
 
@@ -1091,18 +1296,20 @@ impl<'a, T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
     ArtifactsCache<'a, T, C>
 {
     /// Create a new cache instance with the given files
-    #[instrument(name = "ArtifactsCache::new", skip(project, edges))]
+    #[instrument(name = "ArtifactsCache::new", skip(project, edges, sources))]
     pub fn new(
         project: &'a Project<C, T>,
         edges: GraphEdges<C::Parser>,
+        sources: Sources,
         preprocessed: bool,
     ) -> Result<Self> {
-        Self::with_storage(project, edges, preprocessed, None)
+        Self::with_storage(project, edges, sources, preprocessed, None)
     }
 
     pub fn with_storage(
         project: &'a Project<C, T>,
         edges: GraphEdges<C::Parser>,
+        sources: Sources,
         preprocessed: bool,
         storage_paths: Option<Box<ProjectPathsConfig<C::Language>>>,
     ) -> Result<Self> {
@@ -1146,50 +1353,19 @@ impl<'a, T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
 
             cache.remove_missing_files();
 
-            // read all artifacts
-            let mut cached_artifacts = if storage.artifacts.exists() {
-                trace!("reading artifacts from cache...");
-                // if we failed to read the whole set of artifacts we use an empty set
-                // Only artifacts in the current source graph can be returned by this compilation.
-                // Avoid deserializing cached artifacts from unrelated partial compilations.
-                let in_scope = cache
-                    .files
-                    .keys()
-                    .filter(|file| edges.get_parsed_source(file).is_some())
-                    .cloned()
-                    .collect::<HashSet<_>>();
-                let artifacts = cache
-                    .read_artifacts_filtered::<T::Artifact, _>(|file| in_scope.contains(file))
-                    .unwrap_or_default();
-                trace!("read {} artifacts from cache", artifacts.artifact_files().count());
-                artifacts
-            } else {
-                Default::default()
-            };
-
-            trace!("reading build infos from cache...");
-            let cached_builds = cache.read_builds(&storage.build_infos).unwrap_or_default();
-
-            // Remove artifacts for which we are missing a build info.
-            cached_artifacts.0.retain(|_, artifacts| {
-                artifacts.retain(|_, artifacts| {
-                    artifacts.retain(|artifact| cached_builds.contains_key(&artifact.build_id));
-                    !artifacts.is_empty()
-                });
-                !artifacts.is_empty()
-            });
-
             let cache = ArtifactsCacheInner {
                 cache,
-                cached_artifacts,
-                cached_builds,
+                cached_artifacts: Default::default(),
+                cached_builds: Default::default(),
                 edges,
                 project,
                 storage_paths,
+                sources,
                 dirty_sources: Default::default(),
                 content_hashes: Default::default(),
                 sources_in_scope: Default::default(),
                 interface_repr_hashes: Default::default(),
+                missing_extra_files: None,
             };
 
             ArtifactsCache::Cached(cache)
@@ -1329,6 +1505,7 @@ impl<'a, T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler>
             content_hashes: _,
             interface_repr_hashes: _,
             storage_paths,
+            ..
         } = cache;
 
         // Remove cached artifacts which are out of scope, dirty or appear in `written_artifacts`.

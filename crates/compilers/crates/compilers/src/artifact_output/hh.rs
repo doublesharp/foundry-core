@@ -61,6 +61,10 @@ impl ArtifactOutput for HardhatArtifacts {
     ) -> Option<Self::Artifact> {
         None
     }
+
+    fn requires_extra_output_check(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

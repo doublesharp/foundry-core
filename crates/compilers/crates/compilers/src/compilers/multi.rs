@@ -11,6 +11,7 @@ use super::{
 use crate::{
     SourceParser,
     artifacts::vyper::{VyperCompilationError, VyperSettings},
+    cache::compiler_output::CompilerOutputCache,
     parser::VyperParser,
     resolver::parse::{SolData, SolParser},
     settings::VyperRestrictions,
@@ -31,6 +32,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 /// Compiler capable of compiling both Solidity and Vyper sources.
@@ -57,6 +59,13 @@ impl MultiCompiler {
     pub fn new(solc: Option<SolcCompiler>, vyper_path: Option<PathBuf>) -> Result<Self> {
         let vyper = vyper_path.map(Vyper::new).transpose()?;
         Ok(Self { solc, vyper })
+    }
+
+    /// Configures a raw compiler-output cache for the Solidity compiler when one is available.
+    pub fn set_compiler_output_cache(&mut self, cache: Arc<dyn CompilerOutputCache>) {
+        if let Some(solc) = &mut self.solc {
+            solc.set_compiler_output_cache(cache);
+        }
     }
 }
 

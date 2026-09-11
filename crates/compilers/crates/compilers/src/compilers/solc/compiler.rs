@@ -1,22 +1,33 @@
-#[cfg(feature = "async")]
-use super::command::async_retry_spawn;
 use super::command::retry_spawn;
-use crate::resolver::parse::SolData;
+use crate::{
+    cache::compiler_output::{CompilerOutputCache, CompilerOutputCacheKey},
+    compilers::compiler_path::resolve,
+    resolver::parse::SolData,
+};
+use alloy_primitives::{B256, keccak256};
 use foundry_compilers_artifacts::{CompilerOutput, SolcInput, sources::Source};
 use foundry_compilers_core::{
     error::{Result, SolcError},
-    utils::{SUPPORTS_BASE_PATH, SUPPORTS_INCLUDE_PATH},
+    utils::{SUPPORTS_BASE_PATH, SUPPORTS_INCLUDE_PATH, canonicalize},
 };
 use itertools::Itertools;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     str::FromStr,
+    sync::{LazyLock, Mutex},
+    time::SystemTime,
 };
+
+#[cfg(feature = "async")]
+use super::command::async_retry_spawn;
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 /// Extensions acceptable by solc compiler.
 pub const SOLC_EXTENSIONS: &[&str] = &["sol", "yul"];
@@ -24,6 +35,33 @@ pub const SOLC_EXTENSIONS: &[&str] = &["sol", "yul"];
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn_tests.rs"]
 mod spawn_tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedCompilerIdentity {
+    fingerprint: CompilerIdentityFingerprint,
+    digest: B256,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompilerIdentityFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+static COMPILER_IDENTITIES: LazyLock<Mutex<HashMap<PathBuf, CachedCompilerIdentity>>> =
+    LazyLock::new(Mutex::default);
+
+#[cfg(test)]
+static COMPILER_IDENTITY_READS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(Mutex::default);
 
 /// take the lock in tests, we use this to enforce that
 /// a test does not run while a compiler version is being installed
@@ -76,7 +114,7 @@ pub static RELEASES: std::sync::LazyLock<(svm::Releases, Vec<Version>, bool)> =
 ///   2. [svm](https://github.com/roynalnaruto/svm-rs)'s  `global_version` (set via `svm use
 ///      <version>`), stored at `<svm_home>/.global_version`
 ///   3. `solc` otherwise
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Solc {
     /// Path to the `solc` executable
     pub solc: PathBuf,
@@ -90,6 +128,49 @@ pub struct Solc {
     pub include_paths: BTreeSet<PathBuf>,
     /// Additional arbitrary arguments.
     pub extra_args: Vec<String>,
+    /// Optional cache for successful raw standard-json compiler output.
+    #[serde(skip)]
+    compiler_output_cache: Option<std::sync::Arc<dyn CompilerOutputCache>>,
+}
+
+impl PartialEq for Solc {
+    fn eq(&self, other: &Self) -> bool {
+        self.solc == other.solc
+            && self.version == other.version
+            && self.base_path == other.base_path
+            && self.allow_paths == other.allow_paths
+            && self.include_paths == other.include_paths
+            && self.extra_args == other.extra_args
+    }
+}
+
+impl Eq for Solc {}
+
+impl PartialOrd for Solc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Solc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.solc,
+            &self.version,
+            &self.base_path,
+            &self.allow_paths,
+            &self.include_paths,
+            &self.extra_args,
+        )
+            .cmp(&(
+                &other.solc,
+                &other.version,
+                &other.base_path,
+                &other.allow_paths,
+                &other.include_paths,
+                &other.extra_args,
+            ))
+    }
 }
 
 impl Solc {
@@ -109,7 +190,7 @@ impl Solc {
         path: impl Into<PathBuf>,
         extra_args: impl IntoIterator<Item: Into<String>>,
     ) -> Result<Self> {
-        let path = path.into();
+        let path = resolve(&path.into())?;
         let extra_args = extra_args.into_iter().map(Into::into).collect::<Vec<_>>();
         let version = Self::version_with_args(path.clone(), &extra_args)?;
         Ok(Self::_new(path, version, extra_args))
@@ -117,7 +198,8 @@ impl Solc {
 
     /// A new instance which points to `solc` with the given version
     pub fn new_with_version(path: impl Into<PathBuf>, version: Version) -> Self {
-        Self::_new(path.into(), version, Default::default())
+        let path = path.into();
+        Self::_new(resolve(&path).unwrap_or(path), version, Default::default())
     }
 
     fn _new(path: PathBuf, version: Version, extra_args: Vec<String>) -> Self {
@@ -128,6 +210,7 @@ impl Solc {
             allow_paths: Default::default(),
             include_paths: Default::default(),
             extra_args,
+            compiler_output_cache: None,
         };
         this.debug_assert();
         this
@@ -142,6 +225,15 @@ impl Solc {
             assert_eq!(v.minor, self.version.minor);
             assert_eq!(v.patch, self.version.patch);
         }
+    }
+
+    /// Configures a cache for successful raw standard-json compiler output.
+    ///
+    /// Callers must only opt in compilers whose behavior is fully identified by the executable and
+    /// its invocation path, reported version, standard-json input, and command arguments.
+    /// Foundry does not opt local wrapper scripts into shared caching automatically.
+    pub fn set_compiler_output_cache(&mut self, cache: std::sync::Arc<dyn CompilerOutputCache>) {
+        self.compiler_output_cache = Some(cache);
     }
 
     /// Parses the given source looking for the `pragma` definition and
@@ -432,20 +524,103 @@ impl Solc {
     /// Compiles with `--standard-json` and deserializes the output as the given `D`.
     #[instrument(name = "Solc::compile", skip_all)]
     pub fn compile_as<T: Serialize, D: DeserializeOwned>(&self, input: &T) -> Result<D> {
-        let output = self.compile_output(input)?;
+        let input = serde_json::to_vec(input)?;
+        if self.compiler_output_cache.is_none() {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "disabled",
+                reason = "not_configured",
+            );
+        }
+        let cache_key = self
+            .compiler_output_cache
+            .as_ref()
+            .and_then(|_| self.compiler_output_cache_key(&input));
+        if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && let Some(output) = cache.read(key)
+        {
+            match serde_json::from_slice(&output) {
+                Ok(output) => return Ok(output),
+                Err(_) => {
+                    trace!(
+                        target: "foundry_compilers::compiler_cache",
+                        outcome = "corrupt",
+                        key = %key,
+                        reason = "invalid_json",
+                    );
+                    cache.invalidate(key);
+                }
+            }
+        }
 
-        // Only run UTF-8 validation once.
-        let output = std::str::from_utf8(&output).map_err(|_| SolcError::InvalidUtf8)?;
+        let raw_output = self.compile_output_bytes(&input)?;
+        let output = serde_json::from_slice(&raw_output)?;
+        // The executable may have changed between lookup and process creation.
+        if let Some((cache, (key, identity))) =
+            self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && cached_compiler_identity(&self.solc).as_ref() == Some(identity)
+        {
+            cache.write(key, &raw_output);
+        }
+        Ok(output)
+    }
 
-        Ok(serde_json::from_str(output)?)
+    fn compiler_output_cache_key(
+        &self,
+        input: &[u8],
+    ) -> Option<(CompilerOutputCacheKey, CachedCompilerIdentity)> {
+        if has_path_overrides(&self.extra_args) {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "bypass",
+                reason = "path_override",
+            );
+            return None;
+        }
+        if !is_cacheable_compiler_input(input) {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "bypass",
+                reason = "input_not_closed",
+            );
+            return None;
+        }
+        let identity = match cached_compiler_identity(&self.solc) {
+            Some(identity) => identity,
+            None => {
+                trace!(
+                    target: "foundry_compilers::compiler_cache",
+                    outcome = "bypass",
+                    reason = "compiler_identity_unavailable",
+                );
+                return None;
+            }
+        };
+        // Dispatch wrappers can select a compiler from their invocation path.
+        let mut invocation = self.solc.as_os_str().as_encoded_bytes().to_vec();
+        invocation.extend_from_slice(identity.digest.as_slice());
+        let key = CompilerOutputCacheKey::new_with_executable_hash(
+            &self.version,
+            keccak256(invocation),
+            input,
+            self.base_path.as_deref(),
+            self.allow_paths.iter().map(PathBuf::as_path),
+            self.include_paths.iter().map(PathBuf::as_path),
+            &self.extra_args,
+        );
+        Some((key, identity))
     }
 
     /// Compiles with `--standard-json` and returns the raw `stdout` output.
     #[instrument(name = "Solc::compile_raw", skip_all)]
     pub fn compile_output<T: Serialize>(&self, input: &T) -> Result<Vec<u8>> {
+        self.compile_output_bytes(&serde_json::to_vec(input)?)
+    }
+
+    fn compile_output_bytes(&self, input: &[u8]) -> Result<Vec<u8>> {
         let mut cmd = self.configure_cmd();
 
-        trace!(input=%serde_json::to_string(input).unwrap_or_else(|e| e.to_string()));
+        trace!(input=%String::from_utf8_lossy(input));
         debug!(?cmd, "compiling");
 
         let mut child = retry_spawn(|| cmd.spawn()).map_err(self.map_io_err())?;
@@ -453,7 +628,7 @@ impl Solc {
 
         {
             let mut stdin = io::BufWriter::new(child.stdin.take().unwrap());
-            serde_json::to_writer(&mut stdin, input)?;
+            stdin.write_all(input).map_err(self.map_io_err())?;
             stdin.flush().map_err(self.map_io_err())?;
         }
         debug!("wrote JSON input to stdin");
@@ -476,7 +651,12 @@ impl Solc {
 
     /// Invokes `solc --version` and parses the output as a SemVer [`Version`].
     pub fn version_with_args(solc: impl Into<PathBuf>, args: &[String]) -> Result<Version> {
-        crate::cache_version(solc.into(), args, |solc| Self::version_impl(solc, args))
+        let solc = solc.into();
+        // An executable or parent-directory alias can change without changing the cache key.
+        if canonicalize(&solc).is_ok_and(|resolved| resolved != solc) {
+            return Self::version_impl(&solc, args);
+        }
+        crate::cache_version(solc, args, |solc| Self::version_impl(solc, args))
     }
 
     fn version_impl(solc: &Path, args: &[String]) -> Result<Version> {
@@ -610,6 +790,136 @@ impl Solc {
     }
 }
 
+fn is_cacheable_compiler_input(input: &[u8]) -> bool {
+    let Ok(input) = serde_json::from_slice::<serde_json::Value>(input) else {
+        return false;
+    };
+    if input.get("language").and_then(serde_json::Value::as_str) != Some("Solidity") {
+        return false;
+    }
+    let Some(sources) = input.get("sources").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let source_names = sources.keys().map(String::as_str).collect::<HashSet<_>>();
+    if !source_names.iter().all(|source_name| is_canonical_source_unit(source_name)) {
+        return false;
+    }
+    let Some(remappings) = canonical_remappings(&input) else {
+        return false;
+    };
+
+    sources.iter().all(|(source_name, source)| {
+        let Some(content) = source.get("content").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let parsed = SolData::parse(content, Path::new(source_name));
+        if parsed.parse_result().is_err() {
+            return false;
+        }
+        parsed.imports.iter().all(|import| {
+            resolved_import_source_unit(source_name, import.data().path(), &remappings)
+                .is_some_and(|source_unit| source_names.contains(source_unit.as_str()))
+        })
+    })
+}
+
+fn resolved_import_source_unit(
+    source_name: &str,
+    import_path: &Path,
+    remappings: &[CanonicalRemapping<'_>],
+) -> Option<String> {
+    let source_unit = resolve_import_source_unit(source_name, import_path.to_str()?)?;
+    let source_unit = if let Some(remapping) = select_remapping(&source_unit, remappings) {
+        format!("{}{}", remapping.target, &source_unit[remapping.prefix.len()..])
+    } else {
+        source_unit
+    };
+    is_canonical_source_unit(&source_unit).then_some(source_unit)
+}
+
+/// Resolves the canonical subset of Solidity's string-based relative-import algorithm.
+fn resolve_import_source_unit(source_name: &str, import_path: &str) -> Option<String> {
+    if !import_path.starts_with("./") && !import_path.starts_with("../") {
+        return is_canonical_source_unit(import_path).then(|| import_path.to_owned());
+    }
+
+    let mut source_segments = source_name.split('/').collect::<Vec<_>>();
+    source_segments.pop();
+    let mut import_path = import_path;
+    if let Some(rest) = import_path.strip_prefix("./") {
+        import_path = rest;
+    } else {
+        while let Some(rest) = import_path.strip_prefix("../") {
+            source_segments.pop()?;
+            import_path = rest;
+        }
+    }
+    is_canonical_source_unit(import_path).then(|| {
+        source_segments.push(import_path);
+        source_segments.join("/")
+    })
+}
+
+fn is_canonical_source_unit(source_unit: &str) -> bool {
+    !source_unit.is_empty()
+        && !source_unit.starts_with('/')
+        && !source_unit.contains(':')
+        && !source_unit.contains('\\')
+        && source_unit.split('/').all(|segment| !matches!(segment, "" | "." | ".."))
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalRemapping<'a> {
+    prefix: &'a str,
+    target: &'a str,
+}
+
+fn canonical_remappings(input: &serde_json::Value) -> Option<Vec<CanonicalRemapping<'_>>> {
+    let Some(settings) = input.get("settings") else {
+        return Some(Vec::new());
+    };
+    let settings = settings.as_object()?;
+    let Some(remappings) = settings.get("remappings") else {
+        return Some(Vec::new());
+    };
+    remappings
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .map(|remapping| {
+            let (prefix, target) = remapping?.split_once('=')?;
+            is_canonical_remapping_path(prefix)
+                .then_some(CanonicalRemapping { prefix, target })
+                .filter(|_| is_canonical_remapping_path(target))
+        })
+        .collect()
+}
+
+fn is_canonical_remapping_path(path: &str) -> bool {
+    is_canonical_source_unit(path) || path.strip_suffix('/').is_some_and(is_canonical_source_unit)
+}
+
+fn select_remapping<'a>(
+    source_unit: &str,
+    remappings: &'a [CanonicalRemapping<'a>],
+) -> Option<CanonicalRemapping<'a>> {
+    remappings
+        .iter()
+        .enumerate()
+        .filter(|(_, remapping)| source_unit.starts_with(remapping.prefix))
+        .max_by_key(|(index, remapping)| (remapping.prefix.len(), *index))
+        .map(|(_, remapping)| *remapping)
+}
+
+fn has_path_overrides(extra_args: &[String]) -> bool {
+    extra_args.iter().any(|arg| {
+        matches!(arg.as_str(), "--base-path" | "--include-path" | "--allow-paths")
+            || arg.starts_with("--base-path=")
+            || arg.starts_with("--include-path=")
+            || arg.starts_with("--allow-paths=")
+    })
+}
+
 fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) }
 }
@@ -649,20 +959,59 @@ impl Solc {
         &self,
         input: &T,
     ) -> Result<D> {
-        let output = self.async_compile_output(input).await?;
-        Ok(serde_json::from_slice(&output)?)
+        let input = serde_json::to_vec(input)?;
+        if self.compiler_output_cache.is_none() {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "disabled",
+                reason = "not_configured",
+            );
+        }
+        let cache_key = self
+            .compiler_output_cache
+            .as_ref()
+            .and_then(|_| self.compiler_output_cache_key(&input));
+        if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && let Some(output) = cache.read(key)
+        {
+            match serde_json::from_slice(&output) {
+                Ok(output) => return Ok(output),
+                Err(_) => {
+                    trace!(
+                        target: "foundry_compilers::compiler_cache",
+                        outcome = "corrupt",
+                        key = %key,
+                        reason = "invalid_json",
+                    );
+                    cache.invalidate(key);
+                }
+            }
+        }
+
+        let output = self.async_compile_output_bytes(&input).await?;
+        let parsed = serde_json::from_slice(&output)?;
+        // The executable may have changed between lookup and process creation.
+        if let Some((cache, (key, identity))) =
+            self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && cached_compiler_identity(&self.solc).as_ref() == Some(identity)
+        {
+            cache.write(key, &output);
+        }
+        Ok(parsed)
     }
 
     pub async fn async_compile_output<T: Serialize>(&self, input: &T) -> Result<Vec<u8>> {
+        self.async_compile_output_bytes(&serde_json::to_vec(input)?).await
+    }
+
+    async fn async_compile_output_bytes(&self, input: &[u8]) -> Result<Vec<u8>> {
         use tokio::{io::AsyncWriteExt, process::Command};
 
         let mut cmd: Command = self.configure_cmd().into();
         let mut child = async_retry_spawn(|| cmd.spawn()).await.map_err(self.map_io_err())?;
         let stdin = child.stdin.as_mut().unwrap();
 
-        let content = serde_json::to_vec(input)?;
-
-        stdin.write_all(&content).await.map_err(self.map_io_err())?;
+        stdin.write_all(input).await.map_err(self.map_io_err())?;
         stdin.flush().await.map_err(self.map_io_err())?;
 
         compile_output(child.wait_with_output().await.map_err(self.map_io_err())?)
@@ -705,6 +1054,49 @@ impl Solc {
     }
 }
 
+fn cached_compiler_identity(path: &Path) -> Option<CachedCompilerIdentity> {
+    let before = std::fs::metadata(path).ok()?;
+    let before = compiler_identity_fingerprint(&before);
+    #[cfg(unix)]
+    if let Some(identity) = COMPILER_IDENTITIES.lock().ok()?.get(path)
+        && identity.fingerprint == before
+    {
+        return Some(identity.clone());
+    }
+
+    #[cfg(test)]
+    record_compiler_identity_read(path);
+    let executable = std::fs::read(path).ok()?;
+    let after = std::fs::metadata(path).ok()?;
+    let after = compiler_identity_fingerprint(&after);
+    if before != after {
+        return None;
+    }
+    let identity = CachedCompilerIdentity { fingerprint: after, digest: keccak256(executable) };
+    COMPILER_IDENTITIES.lock().ok()?.insert(path.to_path_buf(), identity.clone());
+    Some(identity)
+}
+
+fn compiler_identity_fingerprint(metadata: &std::fs::Metadata) -> CompilerIdentityFingerprint {
+    CompilerIdentityFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        changed_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        changed_nanoseconds: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(test)]
+fn record_compiler_identity_read(path: &Path) {
+    *COMPILER_IDENTITY_READS.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+}
+
 fn compile_output(output: Output) -> Result<Vec<u8>> {
     if output.status.success() { Ok(output.stdout) } else { Err(SolcError::solc_output(&output)) }
 }
@@ -730,6 +1122,1099 @@ fn version_from_output(output: Output) -> Result<Version> {
 impl AsRef<Path> for Solc {
     fn as_ref(&self) -> &Path {
         &self.solc
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_tests {
+    use super::*;
+    use crate::cache::compiler_output::LocalCompilerOutputCache;
+    use serde::Serializer;
+    use std::{
+        env,
+        os::unix::fs::{PermissionsExt, symlink},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct FlippingInput(AtomicUsize);
+
+    impl Serialize for FlippingInput {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let marker = self.0.fetch_add(1, Ordering::Relaxed);
+            serde_json::json!({
+                "language": "Solidity",
+                "sources": {
+                    "src/A.sol": { "content": format!("contract A {{}} // {marker}") },
+                },
+                "settings": { "optimizer": { "enabled": false, "runs": marker } },
+            })
+            .serialize(serializer)
+        }
+    }
+
+    #[test]
+    fn compiler_identity_cache_avoids_warm_rehashes_and_detects_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("solc");
+        let output_cache = Arc::new(LocalCompilerOutputCache::new(directory.path().join("cache")));
+        let input = serde_json::to_vec(&serde_json::json!({
+            "language": "Solidity",
+            "sources": { "src/A.sol": { "content": "contract A {}" } },
+            "settings": {},
+        }))
+        .unwrap();
+        std::fs::write(&executable, b"first compiler identity").unwrap();
+        let original_modified = std::fs::metadata(&executable).unwrap().modified().unwrap();
+
+        let mut first = Solc::new_with_version(&executable, Version::new(0, 8, 35));
+        first.set_compiler_output_cache(output_cache.clone());
+        let identity_path = first.solc.clone();
+        let (first_key, _) = first.compiler_output_cache_key(&input).unwrap();
+        for _ in 1..128 {
+            let mut warm = Solc::new_with_version(&executable, Version::new(0, 8, 35));
+            warm.set_compiler_output_cache(output_cache.clone());
+            assert_eq!(first_key, warm.compiler_output_cache_key(&input).unwrap().0);
+        }
+        assert_eq!(COMPILER_IDENTITY_READS.lock().unwrap()[&identity_path], 1);
+
+        std::fs::write(&executable, b"other compiler identity").unwrap();
+        std::fs::File::open(&executable)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        let mut replaced = Solc::new_with_version(&executable, Version::new(0, 8, 35));
+        replaced.set_compiler_output_cache(output_cache);
+        let (replaced_key, _) = replaced.compiler_output_cache_key(&input).unwrap();
+        assert_ne!(first_key, replaced_key);
+        assert_eq!(COMPILER_IDENTITY_READS.lock().unwrap()[&identity_path], 2);
+    }
+
+    #[test]
+    fn compiler_aliases_preserve_invocation_and_cache_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("dispatch");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo 'Version: 0.8.35'
+else
+    cat >/dev/null
+    printf '{"invoked":"%s"}' "${0##*/}"
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = Arc::new(LocalCompilerOutputCache::new(dir.path().join("cache")));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": { "A.sol": { "content": "contract A {}" } },
+        });
+        for name in ["first", "second"] {
+            let alias = dir.path().join(name);
+            symlink(&executable, &alias).unwrap();
+            let mut solc = Solc::new(&alias).unwrap();
+            let expected = serde_json::json!({ "invoked": name });
+            assert_eq!(solc.compile_as::<_, serde_json::Value>(&input).unwrap(), expected);
+            solc.set_compiler_output_cache(cache.clone());
+            assert_eq!(solc.compile_as::<_, serde_json::Value>(&input).unwrap(), expected);
+            assert_eq!(solc.compile_as::<_, serde_json::Value>(&input).unwrap(), expected);
+        }
+        assert_eq!(cache.stats().entry_count, 2);
+    }
+
+    fn check_compiler_replacement(
+        compile: impl Fn(&Solc, &serde_json::Value) -> serde_json::Value,
+    ) {
+        #[derive(Debug)]
+        struct ReplacingCache {
+            store: LocalCompilerOutputCache,
+            executable: PathBuf,
+            replacement: PathBuf,
+            replaced: std::sync::atomic::AtomicBool,
+        }
+        impl CompilerOutputCache for ReplacingCache {
+            fn read(&self, key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+                if !self.replaced.swap(true, Ordering::Relaxed) {
+                    std::fs::copy(&self.replacement, &self.executable).unwrap();
+                }
+                self.store.read(key)
+            }
+            fn write(&self, key: &CompilerOutputCacheKey, output: &[u8]) {
+                self.store.write(key, output);
+            }
+            fn invalidate(&self, key: &CompilerOutputCacheKey) {
+                self.store.invalidate(key);
+            }
+        }
+        for restore_during_run in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = dir.path().join("solc");
+            let replacement = dir.path().join("replacement");
+            let script = |marker| {
+                format!(
+                    r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo 'Version: 0.8.35'
+else
+    cat >/dev/null
+    echo '{{"marker":"{marker}"}}'
+fi
+"#
+                )
+            };
+            std::fs::write(&executable, script("first")).unwrap();
+            let replacement_script = if restore_during_run {
+                script("second").replace(
+                    "cat >/dev/null",
+                    "cat >/dev/null\n    trap 'cp \"$0.original\" \"$0\"' EXIT",
+                )
+            } else {
+                script("second")
+            };
+            std::fs::write(&replacement, replacement_script).unwrap();
+            std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::copy(&executable, executable.with_extension("original")).unwrap();
+            let cache = Arc::new(ReplacingCache {
+                store: LocalCompilerOutputCache::new(dir.path().join("cache")),
+                executable: executable.clone(),
+                replacement,
+                replaced: std::sync::atomic::AtomicBool::new(false),
+            });
+            let mut solc = Solc::new(&executable).unwrap();
+            solc.set_compiler_output_cache(cache.clone());
+            let input = serde_json::json!({
+                "language": "Solidity",
+                "sources": { "A.sol": { "content": "contract A {}" } },
+            });
+            assert_eq!(compile(&solc, &input)["marker"], "second");
+            assert_eq!(cache.store.stats().entry_count, 0);
+            std::fs::write(&executable, script("first")).unwrap();
+            assert_eq!(compile(&solc, &input)["marker"], "first");
+        }
+    }
+
+    #[test]
+    fn compiler_replacement_during_lookup_does_not_poison_cache() {
+        check_compiler_replacement(|solc, input| solc.compile_as(input).unwrap());
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn async_compiler_replacement_during_lookup_does_not_poison_cache() {
+        let runtime = foundry_compilers_core::utils::RuntimeOrHandle::new();
+        check_compiler_replacement(|solc, input| {
+            runtime.block_on(solc.async_compile_as(input)).unwrap()
+        });
+    }
+
+    #[test]
+    fn retargeted_compiler_alias_invalidates_cached_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("solc");
+        let cache = Arc::new(LocalCompilerOutputCache::new(dir.path().join("cache")));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": { "A.sol": { "content": "contract A {}" } },
+        });
+        let mut solc = Solc::new_with_version(&alias, Version::new(0, 8, 35));
+        solc.set_compiler_output_cache(cache.clone());
+        for (marker, patch) in [("first", 35), ("second", 36)] {
+            let target = dir.path().join(marker);
+            std::fs::write(
+                &target,
+                format!(
+                    r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo 'Version: 0.8.{patch}'
+else
+    cat >/dev/null
+    echo '{{"marker":"{marker}"}}'
+fi
+"#
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if alias.exists() {
+                std::fs::remove_file(&alias).unwrap();
+            }
+            symlink(&target, &alias).unwrap();
+            assert_eq!(Solc::new(&alias).unwrap().version, Version::new(0, 8, patch));
+            assert_eq!(solc.compile_as::<_, serde_json::Value>(&input).unwrap()["marker"], marker);
+        }
+        assert_eq!(cache.stats().entry_count, 2);
+    }
+
+    #[test]
+    fn retargeted_compiler_directory_refreshes_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let alias = dir.path().join("current");
+        for patch in [35, 36] {
+            let target = dir.path().join(patch.to_string());
+            std::fs::create_dir(&target).unwrap();
+            let executable = target.join("solc");
+            std::fs::write(&executable, format!("#!/bin/sh\necho 'Version: 0.8.{patch}'\n"))
+                .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if alias.exists() {
+                std::fs::remove_file(&alias).unwrap();
+            }
+            symlink(&target, &alias).unwrap();
+            assert_eq!(Solc::new(alias.join("solc")).unwrap().version, Version::new(0, 8, patch));
+        }
+    }
+
+    #[test]
+    fn compiler_output_cache_replays_raw_json_without_running_solc() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    touch "{}"
+    echo '{{"contracts":{{}}}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        std::fs::remove_file(&invocations).unwrap();
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, second);
+        assert!(!invocations.exists());
+    }
+
+    #[test]
+    fn compiler_output_cache_rekeys_identical_wrappers_by_full_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+echo x >> "{}"
+echo '{{"contracts":{{}}}}'
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new_with_version(
+            &solc_path,
+            Version::parse("0.8.35+first-wrapper-target").unwrap(),
+        );
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let _ = std::fs::remove_file(&invocations);
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+        let serialized_input = serde_json::to_vec(&input).unwrap();
+        let (first_key, _) = solc.compiler_output_cache_key(&serialized_input).unwrap();
+
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+        solc.version = Version::parse("0.8.35+second-wrapper-target").unwrap();
+        let (second_key, _) = solc.compiler_output_cache_key(&serialized_input).unwrap();
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_ne!(first_key, second_key);
+        assert_eq!(std::fs::read_to_string(invocations).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn compiler_output_cache_keys_the_exact_json_sent_to_solc() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    echo x >> "{}"
+    cat
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+
+        let input = FlippingInput(AtomicUsize::new(1));
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+        let cached: serde_json::Value = solc
+            .compile_as(&serde_json::json!({
+                "language": "Solidity",
+                "sources": { "src/A.sol": { "content": "contract A {} // 2" } },
+                "settings": { "optimizer": { "enabled": false, "runs": 2 } },
+            }))
+            .unwrap();
+
+        assert_eq!(
+            first,
+            serde_json::json!({
+                "language": "Solidity",
+                "sources": { "src/A.sol": { "content": "contract A {} // 1" } },
+                "settings": { "optimizer": { "enabled": false, "runs": 1 } },
+            })
+        );
+        assert_eq!(
+            second,
+            serde_json::json!({
+                "language": "Solidity",
+                "sources": { "src/A.sol": { "content": "contract A {} // 2" } },
+                "settings": { "optimizer": { "enabled": false, "runs": 2 } },
+            })
+        );
+        assert_eq!(cached, second);
+        assert_eq!(std::fs::read_to_string(invocations).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn compiler_output_cache_repairs_json_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    echo x >> "{}"
+    echo '{{"contracts":{{}}}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        let store = Arc::new(LocalCompilerOutputCache::new(dir.path().join("cache")));
+        solc.set_compiler_output_cache(store.clone());
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": { "src/A.sol": { "content": "contract A {}" } },
+        });
+        let (key, _) =
+            solc.compiler_output_cache_key(&serde_json::to_vec(&input).unwrap()).unwrap();
+        store.write(&key, b"not json");
+
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, serde_json::json!({ "contracts": {} }));
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(invocations).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_sources_without_inline_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    echo x >> "{}"
+    echo '{{}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": { "src/A.sol": { "urls": ["src/A.sol"] } },
+        });
+
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(std::fs::read_to_string(invocations).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_omitted_imports_across_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        for (root, output) in
+            [(&first_root, r#"{"root":"first"}"#), (&second_root, r#"{"root":"second"}"#)]
+        {
+            let dependency = root.join("src/Dependency.sol");
+            std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+            std::fs::write(dependency, output).unwrap();
+        }
+
+        let solc_path = dir.path().join("solc");
+        std::fs::write(
+            &solc_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--base-path" ]; then
+        cat "$2/src/Dependency.sol"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": { "src/A.sol": { "content": "import './Dependency.sol';" } },
+        });
+
+        solc.base_path = Some(first_root);
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        solc.base_path = Some(second_root);
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, serde_json::json!({ "root": "first" }));
+        assert_eq!(second, serde_json::json!({ "root": "second" }));
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_commented_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        for (root, output) in
+            [(&first_root, r#"{"root":"first"}"#), (&second_root, r#"{"root":"second"}"#)]
+        {
+            let dependency = root.join("src/Dependency.sol");
+            std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+            std::fs::write(dependency, output).unwrap();
+        }
+
+        let solc_path = dir.path().join("solc");
+        std::fs::write(
+            &solc_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--base-path" ]; then
+        cat "$2/src/Dependency.sol"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": {
+                "src/A.sol": { "content": "import /* generated */ './Dependency.sol';" },
+            },
+        });
+
+        solc.base_path = Some(first_root);
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        solc.base_path = Some(second_root);
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, serde_json::json!({ "root": "first" }));
+        assert_eq!(second, serde_json::json!({ "root": "second" }));
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_bare_imports_with_relative_decoys() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        for (root, output) in
+            [(&first_root, r#"{"root":"first"}"#), (&second_root, r#"{"root":"second"}"#)]
+        {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("Dependency.sol"), output).unwrap();
+        }
+
+        let solc_path = dir.path().join("solc");
+        std::fs::write(
+            &solc_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--base-path" ]; then
+        cat "$2/Dependency.sol"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": {
+                "src/A.sol": { "content": "import 'Dependency.sol';" },
+                "src/Dependency.sol": { "content": "contract Decoy {}" },
+            },
+        });
+
+        solc.base_path = Some(first_root);
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        solc.base_path = Some(second_root);
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, serde_json::json!({ "root": "first" }));
+        assert_eq!(second, serde_json::json!({ "root": "second" }));
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_remapped_imports_with_direct_decoys() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("first");
+        let second_root = dir.path().join("second");
+        for (root, output) in
+            [(&first_root, r#"{"root":"first"}"#), (&second_root, r#"{"root":"second"}"#)]
+        {
+            let dependency = root.join("lib/foo/A.sol");
+            std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+            std::fs::write(dependency, output).unwrap();
+        }
+
+        let solc_path = dir.path().join("solc");
+        std::fs::write(
+            &solc_path,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+    exit 0
+fi
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--base-path" ]; then
+        cat "$2/lib/foo/A.sol"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": {
+                "src/A.sol": { "content": "import 'foo/A.sol';" },
+                "foo/A.sol": { "content": "contract Decoy {}" },
+            },
+            "settings": { "remappings": ["foo/=lib/foo/"] },
+        });
+
+        solc.base_path = Some(first_root);
+        let first: serde_json::Value = solc.compile_as(&input).unwrap();
+        solc.base_path = Some(second_root);
+        let second: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(first, serde_json::json!({ "root": "first" }));
+        assert_eq!(second, serde_json::json!({ "root": "second" }));
+    }
+
+    #[test]
+    fn compiler_output_cache_reuses_a_path_resolved_executable() {
+        let _lock = PATH_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("solc-on-path");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    touch "{}"
+    echo '{{}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let original_path = env::var_os("PATH");
+        let path = env::join_paths(
+            std::iter::once(dir.path().to_path_buf())
+                .chain(env::split_paths(original_path.as_deref().unwrap_or_default())),
+        )
+        .unwrap();
+        // SAFETY: PATH_LOCK serializes this test's process-wide environment mutation.
+        unsafe { env::set_var("PATH", path) };
+
+        let mut solc = Solc::new("solc-on-path").unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+        std::fs::remove_file(&invocations).unwrap();
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        // SAFETY: Restore the process-wide PATH before releasing PATH_LOCK.
+        unsafe {
+            if let Some(path) = original_path {
+                env::set_var("PATH", path);
+            } else {
+                env::remove_var("PATH");
+            }
+        }
+        assert!(!invocations.exists());
+    }
+
+    #[test]
+    fn compiler_output_cache_bypasses_path_overrides_in_extra_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "--version" ]; then
+        echo "solc, the solidity compiler commandline interface"
+        echo "Version: 0.8.35+commit.69074fbd"
+        exit 0
+    fi
+done
+echo x >> "{}"
+echo '{{}}'
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new_with_args(&solc_path, ["--base-path", "/project"]).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert_eq!(std::fs::read_to_string(invocations).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn compiler_output_cache_reuses_graph_expanded_remapping_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    touch "{}"
+    echo '{{}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": {
+                "src/A.sol": { "content": "import 'forge-std/Test.sol';" },
+                "lib/forge-std/src/Test.sol": { "content": "contract Test {}" },
+            },
+            "settings": { "remappings": ["forge-std/=lib/forge-std/src/"] },
+        });
+
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+        std::fs::remove_file(&invocations).unwrap();
+        let _: serde_json::Value = solc.compile_as(&input).unwrap();
+
+        assert!(!invocations.exists());
+    }
+
+    #[test]
+    fn compiler_output_cache_admits_only_canonical_source_unit_closures() {
+        let canonical = |source_name: &str, import: &str, dependency: &str, remappings: &[&str]| {
+            serde_json::json!({
+                "language": "Solidity",
+                "sources": {
+                    source_name: { "content": format!("import '{import}';") },
+                    dependency: { "content": "contract Dependency {}" },
+                },
+                "settings": { "remappings": remappings },
+            })
+        };
+        let cases = [
+            (
+                "direct source unit",
+                canonical("src/A.sol", "lib/Dependency.sol", "lib/Dependency.sol", &[]),
+                true,
+            ),
+            (
+                "relative source unit is remapped after resolution",
+                canonical("src/A.sol", "./Dependency.sol", "lib/Dependency.sol", &["src/=lib/"]),
+                true,
+            ),
+            (
+                "canonical forge std remapping",
+                canonical(
+                    "src/A.sol",
+                    "forge-std/Test.sol",
+                    "lib/forge-std/src/Test.sol",
+                    &["forge-std/=lib/forge-std/src/"],
+                ),
+                true,
+            ),
+            (
+                "longest prefix remapping wins",
+                canonical(
+                    "src/A.sol",
+                    "forge-std/Test.sol",
+                    "lib/forge-std/special/Test.sol",
+                    &[
+                        "forge-std/=lib/forge-std/src/",
+                        "forge-std/Test.sol=lib/forge-std/special/Test.sol",
+                    ],
+                ),
+                true,
+            ),
+            (
+                "last equal prefix remapping wins",
+                canonical(
+                    "src/A.sol",
+                    "forge-std/Test.sol",
+                    "lib/forge-std/last/Test.sol",
+                    &["forge-std/=lib/forge-std/first/", "forge-std/=lib/forge-std/last/"],
+                ),
+                true,
+            ),
+            (
+                "source unit dot segment",
+                canonical("src/./A.sol", "lib/Dependency.sol", "lib/Dependency.sol", &[]),
+                false,
+            ),
+            (
+                "direct import dot segment",
+                canonical("src/A.sol", "lib/./Dependency.sol", "lib/Dependency.sol", &[]),
+                false,
+            ),
+            (
+                "absolute import dot segment",
+                canonical("src/A.sol", "/lib/./Dependency.sol", "/lib/Dependency.sol", &[]),
+                false,
+            ),
+            (
+                "repeated separators",
+                canonical("src/A.sol", "lib//Dependency.sol", "lib/Dependency.sol", &[]),
+                false,
+            ),
+            (
+                "url source unit",
+                canonical(
+                    "https://example.test/A.sol",
+                    "lib/Dependency.sol",
+                    "lib/Dependency.sol",
+                    &[],
+                ),
+                false,
+            ),
+            (
+                "excess parent traversal",
+                canonical("src/A.sol", "../../Dependency.sol", "Dependency.sol", &[]),
+                false,
+            ),
+            (
+                "contextual remapping",
+                canonical(
+                    "src/A.sol",
+                    "forge-std/Test.sol",
+                    "lib/forge-std/src/Test.sol",
+                    &["src/:forge-std/=lib/forge-std/src/"],
+                ),
+                false,
+            ),
+            (
+                "noncanonical remapping target",
+                canonical(
+                    "src/A.sol",
+                    "forge-std/Test.sol",
+                    "lib/forge-std/src/Test.sol",
+                    &["forge-std/=lib/forge-std/./src/"],
+                ),
+                false,
+            ),
+        ];
+
+        for (name, input, expected) in cases {
+            let input = serde_json::to_vec(&input).unwrap();
+            assert_eq!(is_cacheable_compiler_input(&input), expected, "{name}");
+        }
+    }
+
+    #[cfg(feature = "svm-solc")]
+    #[test]
+    fn compiler_output_cache_real_solc_resolution_matrix() {
+        let Some(solc) = Solc::find_svm_installed_version(&Version::new(0, 8, 35)).unwrap() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "direct",
+                serde_json::json!({
+                    "language": "Solidity",
+                    "sources": {
+                        "src/A.sol": {
+                            "content": "import 'lib/Dependency.sol'; contract A is Dependency {}"
+                        },
+                        "lib/Dependency.sol": { "content": "contract Dependency {}" },
+                    },
+                    "settings": {},
+                }),
+            ),
+            (
+                "relative_then_remap",
+                serde_json::json!({
+                    "language": "Solidity",
+                    "sources": {
+                        "src/A.sol": {
+                            "content": "import './Dependency.sol'; contract A is Dependency {}"
+                        },
+                        "lib/Dependency.sol": { "content": "contract Dependency {}" },
+                    },
+                    "settings": { "remappings": ["src/=lib/"] },
+                }),
+            ),
+            (
+                "longest_prefix",
+                serde_json::json!({
+                    "language": "Solidity",
+                    "sources": {
+                        "src/A.sol": {
+                            "content": "import 'forge-std/Test.sol'; contract A is Dependency {}"
+                        },
+                        "lib/forge-std/src/Test.sol": { "content": "contract Fallback {}" },
+                        "lib/forge-std/special/Test.sol": { "content": "contract Dependency {}" },
+                    },
+                    "settings": {
+                        "remappings": [
+                            "forge-std/=lib/forge-std/src/",
+                            "forge-std/Test.sol=lib/forge-std/special/Test.sol",
+                        ],
+                    },
+                }),
+            ),
+            (
+                "last_equal_prefix",
+                serde_json::json!({
+                    "language": "Solidity",
+                    "sources": {
+                        "src/A.sol": {
+                            "content": "import 'forge-std/Test.sol'; contract A is Dependency {}"
+                        },
+                        "lib/forge-std/first/Test.sol": { "content": "contract Fallback {}" },
+                        "lib/forge-std/last/Test.sol": { "content": "contract Dependency {}" },
+                    },
+                    "settings": {
+                        "remappings": [
+                            "forge-std/=lib/forge-std/first/",
+                            "forge-std/=lib/forge-std/last/",
+                        ],
+                    },
+                }),
+            ),
+        ];
+
+        for (name, mut input) in cases {
+            input["settings"]["outputSelection"] = serde_json::json!({ "*": { "*": ["abi"] } });
+            let cache_dir = dir.path().join(name);
+            let mut solc = solc.clone();
+            solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(&cache_dir)));
+            let output: serde_json::Value = solc.compile_as(&input).unwrap();
+            assert!(
+                output["errors"]
+                    .as_array()
+                    .is_none_or(|errors| errors.iter().all(|error| error["severity"] != "error")),
+                "{name}"
+            );
+            assert!(std::fs::read_dir(cache_dir).unwrap().next().is_some(), "{name}");
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn async_compiler_output_cache_replays_without_running_solc() {
+        let dir = tempfile::tempdir().unwrap();
+        let solc_path = dir.path().join("solc");
+        let invocations = dir.path().join("invocations");
+        std::fs::write(
+            &solc_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "solc, the solidity compiler commandline interface"
+    echo "Version: 0.8.35+commit.69074fbd"
+else
+    touch "{}"
+    echo '{{"contracts":{{}}}}'
+fi
+"#,
+                invocations.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&solc_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solc_path, permissions).unwrap();
+
+        let mut solc = Solc::new(&solc_path).unwrap();
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(
+            dir.path().join("cache"),
+        )));
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+
+        let first: serde_json::Value = solc.async_compile_as(&input).await.unwrap();
+        std::fs::remove_file(&invocations).unwrap();
+        let second: serde_json::Value = solc.async_compile_as(&input).await.unwrap();
+
+        assert_eq!(first, second);
+        assert!(!invocations.exists());
     }
 }
 

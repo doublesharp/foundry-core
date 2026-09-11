@@ -15,6 +15,10 @@ pub use artifact_output::*;
 pub mod buildinfo;
 
 pub mod cache;
+pub use cache::compiler_output::{
+    CompilerCachePolicy, CompilerCachePruneReport, CompilerCacheStats, CompilerOutputCache,
+    CompilerOutputCacheKey, LocalCompilerOutputCache,
+};
 
 pub mod flatten;
 
@@ -869,6 +873,10 @@ impl<T: ArtifactOutput<CompilerContract = C::CompilerContract>, C: Compiler> Art
 
     fn is_dirty(&self, artifact_file: &ArtifactFile<Self::Artifact>) -> Result<bool> {
         self.artifacts_handler().is_dirty(artifact_file)
+    }
+
+    fn requires_extra_output_check(&self) -> bool {
+        self.artifacts_handler().requires_extra_output_check()
     }
 
     fn handle_cached_artifacts(&self, artifacts: &Artifacts<Self::Artifact>) -> Result<()> {

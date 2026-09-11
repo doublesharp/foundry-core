@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Features
 
 - Reuse validated ABI artifacts through a separate cache without replacing normal build artifacts. Publish refreshes atomically and prune retired generations and invalid contexts.
+- Cache raw Solidity compiler output locally with integrity checks and configurable retention.
+
+### Bug Fixes
+
+- Preserve compiler invocation aliases and invalidate output when the compiler changes during compilation.
+- Release ABI cache locks even when a compiler process inherits the file descriptor.
+- Retain active compiler-cache entries with short idle policies and reuse unchanged experimental output selections.
 
 ## [0.21.0](https://github.com/foundry-rs/foundry-core/releases/tag/compilers-v0.21.0) - 2026-05-13
 

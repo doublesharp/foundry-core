@@ -2,9 +2,9 @@
 
 use alloy_primitives::{Address, Bytes};
 use foundry_compilers::{
-    Artifact, ConfigurableArtifacts, ExtraOutputFiles, ExtraOutputValues, Graph, Project,
-    ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig, RestrictionsWithVersion,
-    TestFileFilter,
+    Artifact, ArtifactFile, ArtifactOutput, ConfigurableArtifacts, ExtraOutputFiles,
+    ExtraOutputValues, Graph, Project, ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig,
+    RestrictionsWithVersion, TestFileFilter,
     buildinfo::BuildInfo,
     cache::{CompilerCache, SOLIDITY_FILES_CACHE_FILENAME},
     compilers::{
@@ -19,15 +19,17 @@ use foundry_compilers::{
     project::{Preprocessor, ProjectCompiler},
     project_util::*,
     solc::{Restriction, SolcRestrictions, SolcSettings},
+    sources::VersionedSourceFile,
     take_solc_installer_lock,
 };
 use foundry_compilers_artifacts::{
-    BytecodeHash, Contract, DevDoc, Error, ErrorDoc, EventDoc, EvmVersion, Libraries, MethodDoc,
-    ModelCheckerEngine::CHC, ModelCheckerSettings, Settings, Severity, SolcInput, Source, UserDoc,
-    UserDocNotice, output_selection::OutputSelection, remappings::Remapping,
+    BytecodeHash, ConfigurableContractArtifact, Contract, DevDoc, Error, ErrorDoc, EventDoc,
+    EvmVersion, Libraries, MethodDoc, ModelCheckerEngine::CHC, ModelCheckerSettings, Settings,
+    Severity, SolcInput, Source, UserDoc, UserDocNotice, output_selection::OutputSelection,
+    remappings::Remapping,
 };
 use foundry_compilers_core::{
-    error::SolcError,
+    error::{Result, SolcError},
     utils::{self, RuntimeOrHandle, canonicalize},
 };
 use semver::Version;
@@ -42,6 +44,36 @@ use std::{
     sync::LazyLock,
 };
 use svm::{Platform, platform};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AlwaysDirtyArtifacts;
+
+impl ArtifactOutput for AlwaysDirtyArtifacts {
+    type Artifact = ConfigurableContractArtifact;
+    type CompilerContract = Contract;
+
+    fn contract_to_artifact(
+        &self,
+        file: &Path,
+        name: &str,
+        contract: Contract,
+        source_file: Option<&foundry_compilers_artifacts::SourceFile>,
+    ) -> Self::Artifact {
+        ConfigurableArtifacts::default().contract_to_artifact(file, name, contract, source_file)
+    }
+
+    fn standalone_source_file_to_artifact(
+        &self,
+        _path: &Path,
+        _file: &VersionedSourceFile,
+    ) -> Option<Self::Artifact> {
+        None
+    }
+
+    fn is_dirty(&self, _artifact_file: &ArtifactFile<Self::Artifact>) -> Result<bool> {
+        Ok(true)
+    }
+}
 
 pub static VYPER: LazyLock<Vyper> = LazyLock::new(|| {
     RuntimeOrHandle::new().block_on(async {
@@ -1356,6 +1388,115 @@ fn can_compile_dapp_sample_with_cache() {
 }
 
 #[test]
+fn cached_project_loads_only_clean_artifacts_once() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.add_basic_source("A", "^0.8.10").unwrap();
+    project.add_basic_source("B", "^0.8.10").unwrap();
+    project.add_basic_source("C", "^0.8.10").unwrap();
+    project.compile().unwrap().assert_success();
+
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read_joined(project.paths()).unwrap();
+    cache.builds.insert("unused".to_string());
+    cache.write(project.cache_path()).unwrap();
+    fs::write(
+        project.project().build_info_path().join("unused.json"),
+        r#"{"sourceIdToPath":{},"language":"Solidity"}"#,
+    )
+    .unwrap();
+
+    project
+        .add_source(
+            "A",
+            r#"
+pragma solidity ^0.8.10;
+contract A {
+    function changed() public {}
+}
+"#,
+        )
+        .unwrap();
+
+    let _measurement =
+        foundry_compilers::cache::test_utils::start_cache_io_measurement(project.root());
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+
+    assert_eq!(
+        foundry_compilers::cache::test_utils::cache_io_counters(),
+        foundry_compilers::cache::test_utils::CacheIoCounters {
+            graph_resolutions: 1,
+            artifact_deserializations: 2,
+            build_info_deserializations: 1,
+            extra_output_scans: 0,
+        },
+    );
+}
+
+#[test]
+fn cached_project_scans_extra_outputs_once() {
+    let handler = ConfigurableArtifacts {
+        additional_files: ExtraOutputFiles { bytecode: true, ..Default::default() },
+        ..Default::default()
+    };
+    let project = TempProject::<MultiCompiler, ConfigurableArtifacts>::with_artifacts(
+        ProjectPathsConfig::builder(),
+        handler,
+    )
+    .unwrap();
+    project.add_basic_source("A", "^0.8.10").unwrap();
+    project.add_basic_source("B", "^0.8.10").unwrap();
+    project.add_basic_source("C", "^0.8.10").unwrap();
+    project.compile().unwrap().assert_success();
+
+    project
+        .add_source(
+            "A",
+            r#"
+pragma solidity ^0.8.10;
+contract A {
+    function changed() public {}
+}
+"#,
+        )
+        .unwrap();
+
+    let _measurement =
+        foundry_compilers::cache::test_utils::start_cache_io_measurement(project.root());
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+
+    assert_eq!(
+        foundry_compilers::cache::test_utils::cache_io_counters(),
+        foundry_compilers::cache::test_utils::CacheIoCounters {
+            graph_resolutions: 1,
+            artifact_deserializations: 2,
+            build_info_deserializations: 1,
+            extra_output_scans: 1,
+        },
+    );
+}
+
+#[test]
+fn cached_wildcard_output_selection_reuses_exact_request() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.add_basic_source("A", "^0.8.10").unwrap();
+
+    project.project_mut().update_output_selection(|selection| {
+        *selection = OutputSelection::empty().with_output("*", "*", ["abi".to_string()]);
+    });
+    project.compile().unwrap().assert_success();
+
+    project.project_mut().update_output_selection(|selection| {
+        *selection = OutputSelection::empty().with_output("src/A.sol", "A", ["abi".to_string()]);
+    });
+    let compiled = project.compile().unwrap();
+
+    compiled.assert_success();
+    assert!(compiled.is_unchanged());
+    assert!(compiled.output().is_empty());
+}
+
+#[test]
 fn partial_compile_ignores_out_of_scope_artifacts() {
     let project = TempProject::<MultiCompiler>::dapptools().unwrap();
     let a = project.add_basic_source("A", "^0.8.10").unwrap();
@@ -1372,6 +1513,82 @@ fn partial_compile_ignores_out_of_scope_artifacts() {
     assert!(compiled.is_unchanged());
     assert!(compiled.find(&a, "A").is_some());
     assert!(compiled.find(&b, "B").is_none());
+
+    let cache = CompilerCache::<MultiCompilerSettings>::read_joined(project.paths()).unwrap();
+    assert!(cache.entry(&b).is_some());
+
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+    assert!(compiled.find(&b, "B").is_some());
+}
+
+#[test]
+fn partial_compile_invalidates_cached_out_of_scope_importers() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let a = project
+        .add_source(
+            "A",
+            r#"
+pragma solidity ^0.8.10;
+contract A {
+    function value() public pure returns (uint256) { return 1; }
+}
+"#,
+        )
+        .unwrap();
+    let b = project
+        .add_source(
+            "B",
+            r#"
+pragma solidity ^0.8.10;
+import "./A.sol";
+contract B is A {}
+"#,
+        )
+        .unwrap();
+    let c = project.add_basic_source("C", "^0.8.10").unwrap();
+
+    project.compile().unwrap().assert_success();
+    let cache = CompilerCache::<MultiCompilerSettings>::read_joined(project.paths()).unwrap();
+    let b_build_id = cache.entry(&b).unwrap().artifacts().next().unwrap().build_id.clone();
+    let c_build_id = cache.entry(&c).unwrap().artifacts().next().unwrap().build_id.clone();
+
+    project
+        .add_source(
+            "A",
+            r#"
+pragma solidity ^0.8.10;
+contract A {
+    function value() public pure returns (uint256) { return 2; }
+}
+"#,
+        )
+        .unwrap();
+    project.project().compile_file(&a).unwrap().assert_success();
+
+    let cache = CompilerCache::<MultiCompilerSettings>::read_joined(project.paths()).unwrap();
+    assert!(cache.entry(&b).is_none());
+    assert_eq!(cache.entry(&c).unwrap().artifacts().next().unwrap().build_id, c_build_id);
+
+    project.compile().unwrap().assert_success();
+    let cache = CompilerCache::<MultiCompilerSettings>::read_joined(project.paths()).unwrap();
+    assert_ne!(cache.entry(&b).unwrap().artifacts().next().unwrap().build_id, b_build_id);
+}
+
+#[test]
+fn cache_respects_custom_artifact_dirty_checks() {
+    let project = TempProject::<MultiCompiler, AlwaysDirtyArtifacts>::with_artifacts(
+        ProjectPathsConfig::builder(),
+        AlwaysDirtyArtifacts,
+    )
+    .unwrap();
+    project.add_basic_source("A", "^0.8.10").unwrap();
+    project.compile().unwrap().assert_success();
+
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {

@@ -395,6 +395,10 @@ impl ArtifactOutput for ConfigurableArtifacts {
         Ok(false)
     }
 
+    fn requires_extra_output_check(&self) -> bool {
+        self.additional_files != ExtraOutputFiles::default()
+    }
+
     /// Writes extra files for cached artifacts based on [Self::additional_files].
     fn handle_cached_artifacts(
         &self,
