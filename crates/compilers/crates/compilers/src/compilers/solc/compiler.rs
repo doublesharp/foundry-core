@@ -4,7 +4,7 @@ use crate::{
     compilers::compiler_path::resolve,
     resolver::parse::SolData,
 };
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, Keccak256, keccak256};
 use foundry_compilers_artifacts::{CompilerOutput, SolcInput, sources::Source};
 use foundry_compilers_core::{
     error::{Result, SolcError},
@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     str::FromStr,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
 };
 
@@ -577,14 +577,6 @@ impl Solc {
             );
             return None;
         }
-        if !is_cacheable_compiler_input(input) {
-            trace!(
-                target: "foundry_compilers::compiler_cache",
-                outcome = "bypass",
-                reason = "input_not_closed",
-            );
-            return None;
-        }
         let identity = match cached_compiler_identity(&self.solc) {
             Some(identity) => identity,
             None => {
@@ -608,6 +600,14 @@ impl Solc {
             self.include_paths.iter().map(PathBuf::as_path),
             &self.extra_args,
         );
+        if !is_cacheable_compiler_input(input, key) {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "bypass",
+                reason = "input_not_closed",
+            );
+            return None;
+        }
         Some((key, identity))
     }
 
@@ -790,7 +790,88 @@ impl Solc {
     }
 }
 
-fn is_cacheable_compiler_input(input: &[u8]) -> bool {
+// These process-local caches retain only digests, decisions, and import paths. Invocation keys
+// cover the exact serialized input, so eligibility can reuse their existing digest. Filesystem
+// resolution is never memoized here.
+const MAX_INPUT_ANALYSES: usize = 1024;
+const MAX_SOURCE_ANALYSES: usize = 1024;
+const MAX_SOURCE_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
+static INPUT_ANALYSES: LazyLock<Mutex<HashMap<CompilerOutputCacheKey, bool>>> =
+    LazyLock::new(Mutex::default);
+static SOURCE_ANALYSES: LazyLock<Mutex<SourceAnalyses>> = LazyLock::new(Mutex::default);
+
+type SourceImports = Option<Arc<[PathBuf]>>;
+
+#[derive(Default)]
+struct SourceAnalyses {
+    imports: HashMap<B256, SourceImports>,
+    bytes: usize,
+}
+
+impl SourceAnalyses {
+    fn insert(&mut self, key: B256, imports: SourceImports) {
+        if self.imports.contains_key(&key) {
+            return;
+        }
+        let bytes = std::mem::size_of::<(B256, SourceImports)>()
+            + imports.as_ref().map_or(0, |imports| {
+                std::mem::size_of_val(imports.as_ref())
+                    + imports.iter().map(|path| path.capacity()).sum::<usize>()
+                    + 2 * std::mem::size_of::<usize>()
+            });
+        if bytes > MAX_SOURCE_ANALYSIS_BYTES {
+            return;
+        }
+        if self.imports.len() >= MAX_SOURCE_ANALYSES
+            || self.bytes + bytes > MAX_SOURCE_ANALYSIS_BYTES
+        {
+            self.imports.clear();
+            self.bytes = 0;
+        }
+        self.imports.insert(key, imports);
+        self.bytes += bytes;
+    }
+}
+
+fn cached_source_imports(source_name: &str, content: &str) -> SourceImports {
+    let mut digest = Keccak256::new();
+    digest.update((source_name.len() as u64).to_be_bytes());
+    digest.update(source_name.as_bytes());
+    digest.update(content.as_bytes());
+    let key = digest.finalize();
+    if let Ok(analyses) = SOURCE_ANALYSES.lock()
+        && let Some(imports) = analyses.imports.get(&key)
+    {
+        return imports.clone();
+    }
+    // Parse outside the lock. Concurrent misses may repeat work but cannot block unrelated hits.
+    let parsed = SolData::parse(content, Path::new(source_name));
+    let imports = parsed.parse_result().is_ok().then(|| {
+        parsed.imports.iter().map(|import| import.data().path().to_path_buf()).collect::<Arc<_>>()
+    });
+    if let Ok(mut analyses) = SOURCE_ANALYSES.lock() {
+        analyses.insert(key, imports.clone());
+    }
+    imports
+}
+
+fn is_cacheable_compiler_input(input: &[u8], key: CompilerOutputCacheKey) -> bool {
+    if let Ok(analyses) = INPUT_ANALYSES.lock()
+        && let Some(eligible) = analyses.get(&key)
+    {
+        return *eligible;
+    }
+    let eligible = analyze_compiler_input(input);
+    if let Ok(mut analyses) = INPUT_ANALYSES.lock() {
+        if analyses.len() >= MAX_INPUT_ANALYSES {
+            analyses.clear();
+        }
+        analyses.insert(key, eligible);
+    }
+    eligible
+}
+
+fn analyze_compiler_input(input: &[u8]) -> bool {
     let Ok(input) = serde_json::from_slice::<serde_json::Value>(input) else {
         return false;
     };
@@ -812,12 +893,11 @@ fn is_cacheable_compiler_input(input: &[u8]) -> bool {
         let Some(content) = source.get("content").and_then(serde_json::Value::as_str) else {
             return false;
         };
-        let parsed = SolData::parse(content, Path::new(source_name));
-        if parsed.parse_result().is_err() {
+        let Some(imports) = cached_source_imports(source_name, content) else {
             return false;
-        }
-        parsed.imports.iter().all(|import| {
-            resolved_import_source_unit(source_name, import.data().path(), &remappings)
+        };
+        imports.iter().all(|import| {
+            resolved_import_source_unit(source_name, import, &remappings)
                 .is_some_and(|source_unit| source_names.contains(source_unit.as_str()))
         })
     })
@@ -1133,10 +1213,7 @@ mod cache_tests {
     use std::{
         env,
         os::unix::fs::{PermissionsExt, symlink},
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1158,6 +1235,276 @@ mod cache_tests {
             })
             .serialize(serializer)
         }
+    }
+
+    fn input_cache_key(input: &[u8]) -> CompilerOutputCacheKey {
+        CompilerOutputCacheKey::new(
+            &Version::new(0, 8, 35),
+            b"solc",
+            input,
+            None,
+            [],
+            [],
+            std::iter::empty::<&str>(),
+        )
+    }
+
+    fn is_cacheable_compiler_input(input: &[u8]) -> bool {
+        super::is_cacheable_compiler_input(input, input_cache_key(input))
+    }
+
+    fn uncached_compiler_input(input: &[u8]) -> bool {
+        let Ok(input) = serde_json::from_slice::<serde_json::Value>(input) else {
+            return false;
+        };
+        if input.get("language").and_then(serde_json::Value::as_str) != Some("Solidity") {
+            return false;
+        }
+        let Some(sources) = input.get("sources").and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        let source_names = sources.keys().map(String::as_str).collect::<HashSet<_>>();
+        if !source_names.iter().all(|source_name| is_canonical_source_unit(source_name)) {
+            return false;
+        }
+        let Some(remappings) = canonical_remappings(&input) else {
+            return false;
+        };
+
+        sources.iter().all(|(source_name, source)| {
+            let Some(content) = source.get("content").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let parsed = SolData::parse(content, Path::new(source_name));
+            if parsed.parse_result().is_err() {
+                return false;
+            }
+            parsed.imports.iter().all(|import| {
+                resolved_import_source_unit(source_name, import.data().path(), &remappings)
+                    .is_some_and(|source_unit| source_names.contains(source_unit.as_str()))
+            })
+        })
+    }
+
+    #[derive(Clone)]
+    struct ParseCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ParseCounter {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "SolData::parse" {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn compiler_cache_reuses_source_analysis_and_revalidates_inputs() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::Registry::default(),
+            ParseCounter(count.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let mut input = serde_json::json!({
+                "language": "Solidity",
+                "sources": {
+                    "reuse/Analysis.sol": {"content": "import './Dep.sol'; contract Analysis {}"},
+                    "reuse/Dep.sol": {"content": "contract AnalysisDependency {}"},
+                },
+                "settings": {"optimizer": {"runs": 1234567}},
+            });
+            let eligible = |input: &serde_json::Value| {
+                is_cacheable_compiler_input(&serde_json::to_vec(input).unwrap())
+            };
+            assert!(eligible(&input));
+            assert_eq!(count.swap(0, Ordering::Relaxed), 2);
+            assert!(eligible(&input));
+            assert_eq!(count.swap(0, Ordering::Relaxed), 0, "warm input reparsed");
+            input["settings"]["optimizer"]["runs"] = 7654321.into();
+            assert!(eligible(&input));
+            assert_eq!(count.swap(0, Ordering::Relaxed), 0, "changed settings reparsed sources");
+            input["settings"]["remappings"] = serde_json::json!(["reuse/=missing/"]);
+            assert!(!eligible(&input));
+            input["settings"].as_object_mut().unwrap().remove("remappings");
+            input["sources"].as_object_mut().unwrap().remove("reuse/Dep.sol");
+            assert!(!eligible(&input));
+            input["sources"]["reuse/Analysis.sol"]["content"] = "contract Changed {}".into();
+            assert!(eligible(&input));
+            assert_eq!(count.swap(0, Ordering::Relaxed), 1);
+            input["sources"]["reuse/Analysis.sol"]["content"] = "contract Broken {".into();
+            assert!(!eligible(&input));
+            assert_eq!(count.swap(0, Ordering::Relaxed), 1);
+            assert!(!eligible(&input));
+            input["settings"]["optimizer"]["runs"] = 9999999.into();
+            assert!(!eligible(&input));
+            assert_eq!(count.load(Ordering::Relaxed), 0, "invalid source reparsed");
+        });
+    }
+
+    #[test]
+    fn compiler_cache_input_memo_preserves_json_validation() {
+        let inputs = [
+            r#"{"language":"Solidity","sources":{}}"#,
+            r#"{"language":"Yul","language":"Solidity","sources":{}}"#,
+            r#"{"language":"Solidity","sources":{"A.sol":{"content":"contract A {}","urls":["unused"]}},"settings":{"unknown":{"large":[1,2,3]}}}"#,
+            r#"{"language":"Solidity","sources":{},"settings":null}"#,
+            r#"{"language":"Solidity","sources":{},"settings":{"remappings":null}}"#,
+            r#"{"language":"Solidity","sources":{"A.sol":{"content":null}}}"#,
+            r#"{"language":"Solidity","sources":{"A.sol":{"content":"contract A {}","content":"contract Broken {"}}}"#,
+            r#"{"language":"Solidity","sources":{"A.sol":{"urls":["A.sol"]}}}"#,
+            r#"{"language":"Solidity","sources":{},"settings":{"remappings":[42]}}"#,
+            r#"{"language":"Solidity","sources":{}} trailing"#,
+        ];
+        for input in inputs {
+            let expected = uncached_compiler_input(input.as_bytes());
+            assert_eq!(is_cacheable_compiler_input(input.as_bytes()), expected, "{input}");
+            assert_eq!(is_cacheable_compiler_input(input.as_bytes()), expected, "warm {input}");
+        }
+    }
+
+    #[test]
+    fn compiler_cache_source_metadata_has_count_and_byte_limits() {
+        let mut analyses = SourceAnalyses::default();
+        for index in 0..=MAX_SOURCE_ANALYSES {
+            analyses.insert(keccak256(index.to_be_bytes()), None);
+            assert!(analyses.imports.len() <= MAX_SOURCE_ANALYSES);
+            assert!(analyses.bytes <= MAX_SOURCE_ANALYSIS_BYTES);
+        }
+        assert_eq!(analyses.imports.len(), 1);
+        let oversized = Some(Arc::from([PathBuf::from("x".repeat(MAX_SOURCE_ANALYSIS_BYTES))]));
+        let previous_bytes = analyses.bytes;
+        analyses.insert(keccak256(b"oversized"), oversized);
+        assert_eq!(analyses.imports.len(), 1);
+        assert_eq!(analyses.bytes, previous_bytes);
+        for index in 0_usize..4 {
+            analyses.insert(
+                keccak256(index.to_be_bytes()),
+                Some(Arc::from([PathBuf::from("x".repeat(MAX_SOURCE_ANALYSIS_BYTES / 2))])),
+            );
+            assert!(analyses.bytes <= MAX_SOURCE_ANALYSIS_BYTES);
+        }
+        assert!(analyses.imports.len() <= 2);
+    }
+
+    #[test]
+    fn compiler_cache_concurrent_source_analysis_preserves_imports() {
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..16 {
+                        let imports = cached_source_imports(
+                            "concurrent/Cache.sol",
+                            "import './Dep.sol'; contract ConcurrentCache {}",
+                        )
+                        .unwrap();
+                        assert_eq!(imports.as_ref(), [PathBuf::from("./Dep.sol")]);
+                        assert!(
+                            cached_source_imports("concurrent/Cache.sol", "contract Invalid {")
+                                .is_none()
+                        );
+                    }
+                });
+            }
+        });
+        let first = cached_source_imports(
+            "concurrent/Cache.sol",
+            "import './Dep.sol'; contract ConcurrentCache {}",
+        )
+        .unwrap();
+        let second = cached_source_imports(
+            "concurrent/Cache.sol",
+            "import './Dep.sol'; contract ConcurrentCache {}",
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    #[ignore = "manual compiler cache microbenchmark"]
+    fn compiler_cache_eligibility_benchmark() {
+        let content = format!(
+            "contract A {{ {} }}",
+            (0..1000)
+                .map(|index| format!(
+                    "function f{index}() external pure returns (uint) {{ return {index}; }}"
+                ))
+                .collect::<String>()
+        );
+        let input = serde_json::to_vec(&serde_json::json!({
+            "language": "Solidity", "sources": {"src/Benchmark.sol": {"content": content}},
+            "settings": {"optimizer": {"runs": 200}},
+        }))
+        .unwrap();
+        let key = input_cache_key(&input);
+        assert!(super::is_cacheable_compiler_input(&input, key));
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            assert!(is_cacheable_compiler_input(std::hint::black_box(&input)));
+        }
+        eprintln!("warm key plus eligibility: 128 x {} bytes {:?}", input.len(), start.elapsed());
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            std::hint::black_box(input_cache_key(std::hint::black_box(&input)));
+            assert!(uncached_compiler_input(std::hint::black_box(&input)));
+        }
+        eprintln!(
+            "uncached key plus eligibility: 128 x {} bytes {:?}",
+            input.len(),
+            start.elapsed()
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            assert!(super::is_cacheable_compiler_input(std::hint::black_box(&input), key));
+        }
+        eprintln!(
+            "cache eligibility (precomputed invocation key): 128 x {} bytes {:?}",
+            input.len(),
+            start.elapsed()
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            assert!(uncached_compiler_input(std::hint::black_box(&input)));
+        }
+        eprintln!(
+            "uncached eligibility (precomputed invocation key): 128 x {} bytes {:?}",
+            input.len(),
+            start.elapsed()
+        );
+        let variants = (0..128)
+            .map(|runs| {
+                let mut input: serde_json::Value = serde_json::from_slice(&input).unwrap();
+                input["settings"]["optimizer"]["runs"] = runs.into();
+                let input = serde_json::to_vec(&input).unwrap();
+                let key = input_cache_key(&input);
+                (input, key)
+            })
+            .collect::<Vec<_>>();
+        let start = std::time::Instant::now();
+        for (variant, key) in &variants {
+            assert!(super::is_cacheable_compiler_input(variant, *key));
+        }
+        eprintln!(
+            "settings-only eligibility (precomputed invocation keys): 128 variants {:?}",
+            start.elapsed()
+        );
+        let mut cold_elapsed = std::time::Duration::ZERO;
+        for _ in 0..128 {
+            INPUT_ANALYSES.lock().unwrap().clear();
+            *SOURCE_ANALYSES.lock().unwrap() = SourceAnalyses::default();
+            let start = std::time::Instant::now();
+            assert!(super::is_cacheable_compiler_input(std::hint::black_box(&input), key));
+            cold_elapsed += start.elapsed();
+        }
+        eprintln!(
+            "cold eligibility (precomputed invocation key): 128 x {} bytes {:?}",
+            input.len(),
+            cold_elapsed
+        );
     }
 
     #[test]
@@ -2083,7 +2430,9 @@ fi
 
         for (name, input, expected) in cases {
             let input = serde_json::to_vec(&input).unwrap();
+            assert_eq!(uncached_compiler_input(&input), expected, "legacy {name}");
             assert_eq!(is_cacheable_compiler_input(&input), expected, "{name}");
+            assert_eq!(is_cacheable_compiler_input(&input), expected, "warm {name}");
         }
     }
 

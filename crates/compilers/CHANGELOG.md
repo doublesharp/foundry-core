@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Reduce compiler-output cache key and read allocations, and reuse bounded process-local input and source import analysis.
+
 ### Features
 
 - Reuse validated ABI artifacts through a separate cache without replacing normal build artifacts. Publish refreshes atomically and prune retired generations and invalid contexts.

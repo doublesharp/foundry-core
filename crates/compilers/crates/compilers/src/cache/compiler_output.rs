@@ -1,4 +1,4 @@
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, Keccak256, keccak256};
 use semver::Version;
 use std::{
     collections::HashSet,
@@ -116,7 +116,7 @@ impl CompilerOutputCacheKey {
         include_paths: impl IntoIterator<Item = &'a Path>,
         extra_args: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Self {
-        let mut key = Vec::with_capacity(input.len() + 256);
+        let mut key = Keccak256::new();
         append_part(&mut key, KEY_SCHEMA);
         append_part(&mut key, version.to_string().as_bytes());
         append_part(&mut key, executable_hash.as_slice());
@@ -127,7 +127,7 @@ impl CompilerOutputCacheKey {
         for arg in normalized_extra_args(extra_args, base_path) {
             append_part(&mut key, arg.as_bytes());
         }
-        Self(keccak256(key))
+        Self(key.finalize())
     }
 
     const fn as_slice(&self) -> &[u8] {
@@ -582,9 +582,11 @@ impl CompilerOutputCache for LocalCompilerOutputCache {
             key = %key,
             bytes = output.len(),
         );
-        let output = entry.split_off(ENTRY_HEADER_LEN);
+        // Keep the validated allocation instead of allocating a second payload-sized buffer.
+        entry.copy_within(ENTRY_HEADER_LEN.., 0);
+        entry.truncate(entry.len() - ENTRY_HEADER_LEN);
         self.maybe_prune();
-        Some(output)
+        Some(entry)
     }
 
     fn write(&self, key: &CompilerOutputCacheKey, output: &[u8]) {
@@ -680,12 +682,12 @@ impl CompilerOutputCache for LocalCompilerOutputCache {
     }
 }
 
-fn append_part(buffer: &mut Vec<u8>, part: &[u8]) {
-    buffer.extend_from_slice(&(part.len() as u64).to_be_bytes());
-    buffer.extend_from_slice(part);
+fn append_part(buffer: &mut Keccak256, part: &[u8]) {
+    buffer.update((part.len() as u64).to_be_bytes());
+    buffer.update(part);
 }
 
-fn append_optional_path(buffer: &mut Vec<u8>, path: Option<&Path>, base_path: Option<&Path>) {
+fn append_optional_path(buffer: &mut Keccak256, path: Option<&Path>, base_path: Option<&Path>) {
     match path {
         Some(path) => append_part(buffer, normalized_path(path, base_path).as_bytes()),
         None => append_part(buffer, b"<none>"),
@@ -693,7 +695,7 @@ fn append_optional_path(buffer: &mut Vec<u8>, path: Option<&Path>, base_path: Op
 }
 
 fn append_paths<'a>(
-    buffer: &mut Vec<u8>,
+    buffer: &mut Keccak256,
     paths: impl IntoIterator<Item = &'a Path>,
     base_path: Option<&Path>,
 ) {
@@ -776,6 +778,119 @@ mod tests {
             std::iter::empty::<&Path>(),
             std::iter::empty::<&str>(),
         )
+    }
+
+    #[test]
+    fn key_matches_v2_framing() {
+        for size in [0, 1, 135, 136, 137, 1024 * 1024] {
+            let input = vec![0xab; size];
+            let version = Version::parse("0.8.35+commit.12345678").unwrap();
+            let executable = b"solc executable";
+            let mut framed = Vec::new();
+            for part in [
+                super::KEY_SCHEMA,
+                version.to_string().as_bytes(),
+                alloy_primitives::keccak256(executable).as_slice(),
+                input.as_slice(),
+                b".",
+                &2_u64.to_be_bytes(),
+                b".",
+                b"/external",
+                &1_u64.to_be_bytes(),
+                b"lib",
+                b"--include-path=lib",
+                b"--allow-paths",
+                b".,/external",
+                b"--via-ir",
+            ] {
+                framed.extend_from_slice(&(part.len() as u64).to_be_bytes());
+                framed.extend_from_slice(part);
+            }
+            let actual = CompilerOutputCacheKey::new(
+                &version,
+                executable,
+                &input,
+                Some(Path::new("/project")),
+                [Path::new("/project"), Path::new("/external")],
+                [Path::new("/project/lib")],
+                ["--include-path=/project/lib", "--allow-paths", "/project,/external", "--via-ir"],
+            );
+            assert_eq!(actual.0, alloy_primitives::keccak256(framed));
+        }
+    }
+
+    #[test]
+    fn local_store_reuses_the_entry_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalCompilerOutputCache::new(directory.path());
+        let key = key("allocation reuse");
+        let payload = vec![42; 1024 * 1024];
+        store.write(&key, &payload);
+        let output = store.read(&key).unwrap();
+        assert_eq!(output, payload);
+        assert!(output.capacity() >= output.len() + super::ENTRY_HEADER_LEN);
+    }
+
+    #[test]
+    fn local_store_rejects_every_invalid_entry_region() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalCompilerOutputCache::new(directory.path());
+        let key = key("entry regions");
+        store.write(&key, b"payload");
+        let path = store.entry_path(&key);
+        let valid = std::fs::read(&path).unwrap();
+        let mut corruptions = Vec::new();
+        for offset in [0, 8, 40, 72, super::ENTRY_HEADER_LEN] {
+            let mut corrupt = valid.clone();
+            corrupt[offset] ^= 1;
+            corruptions.push(corrupt);
+        }
+        for length in [0, 7, super::ENTRY_HEADER_LEN - 1, valid.len() - 1] {
+            corruptions.push(valid[..length].to_vec());
+        }
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        corruptions.push(trailing);
+        let mut oversized = valid;
+        oversized[72..super::ENTRY_HEADER_LEN].copy_from_slice(&u64::MAX.to_be_bytes());
+        corruptions.push(oversized);
+        for corrupted in corruptions {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, corrupted).unwrap();
+            assert_eq!(store.read(&key), None);
+            assert!(!path.exists());
+        }
+        store.write(&key, b"");
+        assert_eq!(store.read(&key), Some(Vec::new()));
+    }
+
+    #[test]
+    #[ignore = "manual compiler cache microbenchmark"]
+    fn compiler_cache_io_benchmark() {
+        let input = vec![b'x'; 8 * 1024 * 1024];
+        let start = std::time::Instant::now();
+        for _ in 0..64 {
+            std::hint::black_box(CompilerOutputCacheKey::new(
+                &Version::new(0, 8, 35),
+                b"solc",
+                std::hint::black_box(&input),
+                None,
+                [],
+                [],
+                std::iter::empty::<&str>(),
+            ));
+        }
+        eprintln!("cache key: 64 x 8 MiB {:?}", start.elapsed());
+        let directory = tempfile::tempdir().unwrap();
+        let store = LocalCompilerOutputCache::new(directory.path());
+        let key = key("benchmark");
+        store.write(&key, &input);
+        assert_eq!(store.read(&key).unwrap(), input);
+        let start = std::time::Instant::now();
+        for _ in 0..64 {
+            std::hint::black_box(store.read(&key).unwrap());
+        }
+        eprintln!("cache read: 64 x 8 MiB {:?}", start.elapsed());
     }
 
     #[test]
