@@ -4,8 +4,8 @@ use alloy_primitives::{Address, Bytes};
 use foundry_compilers::{
     Artifact, ArtifactFile, ArtifactOutput, ConfigurableArtifacts, ExtraOutputFiles,
     ExtraOutputValues, Graph, Project, ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig,
-    RestrictionsWithVersion, TestFileFilter,
-    buildinfo::BuildInfo,
+    RestrictionsWithVersion, TestFileFilter, Updates, apply_updates,
+    buildinfo::{BuildInfo, SourceEdit},
     cache::{CompilerCache, SOLIDITY_FILES_CACHE_FILENAME},
     compilers::{
         CompilerOutput,
@@ -16,7 +16,7 @@ use foundry_compilers::{
     flatten::Flattener,
     info::ContractInfo,
     multi::{MultiCompilerInput, MultiCompilerParser, MultiCompilerRestrictions},
-    project::{Preprocessor, ProjectCompiler},
+    project::{NativeDependencyState, Preprocessor, PreprocessorState, ProjectCompiler},
     project_util::*,
     solc::{Restriction, SolcRestrictions, SolcSettings},
     sources::VersionedSourceFile,
@@ -41,7 +41,10 @@ use std::{
     env, fs, io,
     path::{MAIN_SEPARATOR, Path, PathBuf},
     str::FromStr,
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use svm::{Platform, platform};
 
@@ -504,7 +507,8 @@ fn abi_cache_preserves_out_of_scope_mocks() {
         .compile_abi_cached()
         .unwrap()
         .assert_success();
-    let cache = CompilerCache::<MultiCompilerSettings>::read(&cache_path).unwrap();
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read(&cache_path).unwrap();
+    cache.join_entries(project.root());
     assert!(cache.mocks.contains(&mock));
 
     project.add_source("Base", "pragma solidity ^0.8.0; contract Base { function foo() public pure returns(uint) { return 2; } }").unwrap();
@@ -613,6 +617,794 @@ fn abi_cache_preserves_cached_profiles_during_partial_compilation() {
             }
             previous = Some(ids);
         }
+    }
+}
+
+#[test]
+fn preprocessor_state_replaces_only_compiled_profile() {
+    #[derive(Debug)]
+    struct ClassifyCommon(bool);
+
+    impl Preprocessor<MultiCompiler> for ClassifyCommon {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            if input.input.sources.contains_key(Path::new("src/Common.sol")) {
+                state.update(
+                    paths.root.join("src/Common.sol"),
+                    self.0.then_some(NativeDependencyState::Conservative),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    let mut optimized = project.project().settings.clone();
+    optimized.solc.optimizer.enabled = Some(true);
+    optimized.solc.optimizer.runs = Some(10000);
+    project.project_mut().additional_settings.insert("optimized".to_string(), optimized);
+    project.add_source("Common", "pragma solidity ^0.8.0; contract Common {}").unwrap();
+    project
+        .add_source(
+            "Default",
+            "pragma solidity ^0.8.0; import './Common.sol'; contract Default is Common {}",
+        )
+        .unwrap();
+    let optimized = project
+        .add_source(
+            "Optimized",
+            "pragma solidity ^0.8.0; import './Common.sol'; contract Optimized is Common {}",
+        )
+        .unwrap();
+    project.project_mut().restrictions.insert(
+        optimized.clone(),
+        RestrictionsWithVersion {
+            restrictions: MultiCompilerRestrictions {
+                solc: SolcRestrictions {
+                    optimizer_runs: Restriction { min: Some(10000), ..Default::default() },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            version: None,
+        },
+    );
+
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyCommon(true))
+        .compile()
+        .unwrap()
+        .assert_success();
+    // Regenerate only the optimized context while the default artifacts remain cached.
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    for file in [Path::new("src/Common.sol"), Path::new("src/Optimized.sol")] {
+        for (_, profile, artifact) in cache.files[file].artifacts_versions() {
+            if profile == "optimized" {
+                fs::remove_file(project.artifacts_path().join(&artifact.path)).unwrap();
+            }
+        }
+    }
+    ProjectCompiler::with_sources(project.project(), Source::read_all([optimized]).unwrap())
+        .unwrap()
+        .with_preprocessor(ClassifyCommon(false))
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    cache.join_entries(project.root());
+    assert_eq!(
+        cache
+            .native_dependencies
+            .get(&project.paths().sources.join("Common.sol"))
+            .and_then(|versions| versions.get(&Version::new(0, 8, 30)))
+            .and_then(|profiles| profiles.get("default")),
+        Some(&NativeDependencyState::Conservative)
+    );
+    assert!(
+        cache
+            .native_dependencies
+            .get(&project.paths().sources.join("Common.sol"))
+            .and_then(|versions| versions.get(&Version::new(0, 8, 30)))
+            .is_some_and(|profiles| !profiles.contains_key("optimized"))
+    );
+}
+
+#[test]
+fn retired_profile_drops_native_dependency_context() {
+    #[derive(Debug)]
+    struct ClassifyTarget(bool);
+
+    impl Preprocessor<MultiCompiler> for ClassifyTarget {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            if input.input.sources.contains_key(Path::new("src/Target.sol")) {
+                state.update(
+                    paths.root.join("src/Target.sol"),
+                    self.0.then_some(NativeDependencyState::Conservative),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    let mut optimized = project.project().settings.clone();
+    optimized.solc.optimizer.enabled = Some(true);
+    optimized.solc.optimizer.runs = Some(10000);
+    project.project_mut().additional_settings.insert("optimized".to_owned(), optimized);
+    let target =
+        project.add_source("Target", "pragma solidity ^0.8.0; contract Target {}").unwrap();
+    project.project_mut().restrictions.insert(
+        target,
+        RestrictionsWithVersion {
+            restrictions: MultiCompilerRestrictions {
+                solc: SolcRestrictions {
+                    optimizer_runs: Restriction { min: Some(10000), ..Default::default() },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            version: None,
+        },
+    );
+
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyTarget(true))
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    project.project_mut().additional_settings.clear();
+    project.project_mut().restrictions.clear();
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyTarget(false))
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    cache.join_entries(project.root());
+    assert!(!cache.native_dependencies.contains_key(&project.paths().sources.join("Target.sol")));
+}
+
+#[test]
+fn retired_compiler_version_drops_native_dependency_context() {
+    #[derive(Debug)]
+    struct ClassifyConsumer(bool);
+
+    impl Preprocessor<MultiCompiler> for ClassifyConsumer {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            state.update(
+                paths.root.join("test/Consumer.sol"),
+                self.0.then_some(NativeDependencyState::Conservative),
+            );
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.29");
+    let unrelated = project
+        .add_source("Unrelated", "pragma solidity ^0.8.0; contract Unrelated { uint value = 1; }")
+        .unwrap();
+    let consumer =
+        project.add_test("Consumer", "pragma solidity ^0.8.29; contract Consumer {}").unwrap();
+    let caller = project
+        .add_test(
+            "Caller",
+            "pragma solidity ^0.8.29; import './Consumer.sol'; contract Caller is Consumer {}",
+        )
+        .unwrap();
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyConsumer(true))
+        .compile()
+        .unwrap()
+        .assert_success();
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    assert!(
+        cache.native_dependencies[Path::new("test/Consumer.sol")]
+            .contains_key(&Version::new(0, 8, 29))
+    );
+
+    // Retire every artifact that could have embedded the old observation.
+    project.set_solc("0.8.30");
+    for file in [&consumer, &caller] {
+        fs::write(file, fs::read_to_string(file).unwrap().replace("^0.8.29", "^0.8.30")).unwrap();
+    }
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyConsumer(false))
+        .compile()
+        .unwrap()
+        .assert_success();
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    assert!(cache.native_dependencies.is_empty());
+
+    fs::write(unrelated, "pragma solidity ^0.8.0; contract Unrelated { uint value = 2; }").unwrap();
+    let output = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyConsumer(false))
+        .compile()
+        .unwrap();
+    output.assert_success();
+    assert!(!output.is_unchanged());
+    assert!(output.compiled_artifacts().artifact_files().all(|artifact| {
+        !artifact.file.ends_with("Consumer.sol/Consumer.json")
+            && !artifact.file.ends_with("Caller.sol/Caller.json")
+    }));
+}
+
+#[test]
+fn regenerated_source_preserves_dependency_for_surviving_importer() {
+    #[derive(Debug)]
+    struct PreprocessConsumer(bool);
+
+    impl Preprocessor<MultiCompiler> for PreprocessConsumer {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            if let MultiCompilerInput::Solc(input) = input
+                && let Some(consumer) = input.input.sources.get_mut(Path::new("test/Consumer.sol"))
+            {
+                state.update(
+                    paths.root.join("test/Consumer.sol"),
+                    self.0.then(|| {
+                        NativeDependencyState::Known(BTreeSet::from([paths
+                            .root
+                            .join("src/Dep.sol")]))
+                    }),
+                );
+                if !self.0 {
+                    // Model a later job whose preprocessing removes the native deployment.
+                    consumer.content = consumer.content.replace("new Dep().value()", "42").into();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    let dep = project.add_source("Dep", "pragma solidity ^0.8.0; contract Dep { function value() public pure returns (uint) { return 1; } }").unwrap();
+    let consumer = project.add_test("Consumer", "pragma solidity ^0.8.0; import '../src/Dep.sol'; contract Consumer { function value() public returns (uint) { return new Dep().value(); } }").unwrap();
+    project.add_test("Caller", "pragma solidity ^0.8.0; import './Consumer.sol'; contract Caller { function value() public returns (uint) { return new Consumer().value(); } }").unwrap();
+    let initial = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(PreprocessConsumer(true))
+        .compile()
+        .unwrap();
+    initial.assert_success();
+    let initial_caller =
+        initial.find_first("Caller").unwrap().get_bytecode_bytes().unwrap().into_owned();
+
+    // Only Consumer's missing artifact is regenerated; Caller still embeds the old Consumer.
+    fs::remove_file(project.artifacts_path().join("Consumer.sol/Consumer.json")).unwrap();
+    let regenerated =
+        ProjectCompiler::with_sources(project.project(), Source::read_all([consumer]).unwrap())
+            .unwrap()
+            .with_preprocessor(PreprocessConsumer(false))
+            .compile()
+            .unwrap();
+    regenerated.assert_success();
+    assert!(
+        regenerated
+            .compiled_artifacts()
+            .artifact_files()
+            .any(|artifact| artifact.file.ends_with("Consumer.sol/Consumer.json"))
+    );
+    assert!(
+        regenerated
+            .compiled_artifacts()
+            .artifact_files()
+            .all(|artifact| !artifact.file.ends_with("Caller.sol/Caller.json"))
+    );
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    assert_eq!(
+        cache.native_dependencies[Path::new("test/Consumer.sol")][&Version::new(0, 8, 30)]["default"],
+        NativeDependencyState::Known(BTreeSet::from([PathBuf::from("src/Dep.sol")]))
+    );
+
+    fs::write(&dep, fs::read_to_string(&dep).unwrap().replace("return 1", "return 2")).unwrap();
+    let incremental = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(PreprocessConsumer(false))
+        .compile()
+        .unwrap();
+    incremental.assert_success();
+    assert!(
+        incremental
+            .compiled_artifacts()
+            .artifact_files()
+            .any(|artifact| artifact.file.ends_with("Caller.sol/Caller.json"))
+    );
+    let incremental_caller =
+        incremental.find_first("Caller").unwrap().get_bytecode_bytes().unwrap().into_owned();
+    assert_ne!(initial_caller, incremental_caller);
+    project.project().cleanup().unwrap();
+    let clean = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(PreprocessConsumer(false))
+        .compile()
+        .unwrap();
+    clean.assert_success();
+    assert_eq!(
+        &incremental_caller,
+        clean.find_first("Caller").unwrap().get_bytecode_bytes().unwrap().as_ref()
+    );
+}
+
+#[test]
+fn preprocessor_state_preserves_dependency_for_optimized_import() {
+    #[derive(Debug)]
+    struct ClassifyConsumer(bool);
+
+    impl Preprocessor<MultiCompiler> for ClassifyConsumer {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            if input.input.sources.contains_key(Path::new("src/Consumer.sol")) {
+                state.update(
+                    paths.root.join("src/Consumer.sol"),
+                    self.0.then(|| {
+                        NativeDependencyState::Known(BTreeSet::from([paths
+                            .root
+                            .join("src/Dep.sol")]))
+                    }),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    project.add_source("Dep", "pragma solidity ^0.8.0; contract Dep {}").unwrap();
+    project
+        .add_source(
+            "Consumer",
+            "pragma solidity ^0.8.0; import './Dep.sol'; contract Consumer is Dep {}",
+        )
+        .unwrap();
+    let importer = project
+        .add_source(
+            "Importer",
+            "pragma solidity ^0.8.0; import './Consumer.sol'; contract Importer { function consume(Consumer) public {} }",
+        )
+        .unwrap();
+
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyConsumer(true))
+        .compile()
+        .unwrap()
+        .assert_success();
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    cache.join_entries(project.root());
+    assert_eq!(
+        cache
+            .native_dependencies
+            .get(&project.paths().sources.join("Consumer.sol"))
+            .and_then(|versions| versions.get(&Version::new(0, 8, 30)))
+            .and_then(|profiles| profiles.get("default")),
+        Some(&NativeDependencyState::Known(BTreeSet::from([project
+            .paths()
+            .sources
+            .join("Dep.sol")]))),
+        "initial classification was not cached: {:?}",
+        cache.native_dependencies
+    );
+
+    fs::write(
+        importer,
+        "pragma solidity ^0.8.0; import './Consumer.sol'; contract Importer { function consume(Consumer) public {} function changed() public {} }",
+    )
+    .unwrap();
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ClassifyConsumer(false))
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    let mut cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    cache.join_entries(project.root());
+    assert_eq!(
+        cache
+            .native_dependencies
+            .get(&project.paths().sources.join("Consumer.sol"))
+            .and_then(|versions| versions.get(&Version::new(0, 8, 30)))
+            .and_then(|profiles| profiles.get("default")),
+        Some(&NativeDependencyState::Known(BTreeSet::from([project
+            .paths()
+            .sources
+            .join("Dep.sol")])))
+    );
+}
+
+#[test]
+fn conservative_dependency_recompiles_after_repeated_sparse_edits() {
+    #[derive(Debug)]
+    struct ConservativeConsumer;
+
+    impl Preprocessor<MultiCompiler> for ConservativeConsumer {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            if input.input.sources.contains_key(Path::new("test/Consumer.sol")) {
+                state.update(
+                    paths.root.join("test/Consumer.sol"),
+                    Some(NativeDependencyState::Conservative),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let dependency = project
+        .add_source("Dependency", "pragma solidity ^0.8.0; contract Dependency { uint value = 1; }")
+        .unwrap();
+    let consumer =
+        project.add_test("Consumer", "pragma solidity ^0.8.0; contract Consumer {}").unwrap();
+
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ConservativeConsumer)
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    for value in [2, 3] {
+        fs::write(
+            &dependency,
+            format!("pragma solidity ^0.8.0; contract Dependency {{ uint value = {value}; }}"),
+        )
+        .unwrap();
+        let output = ProjectCompiler::with_sources(
+            project.project(),
+            Source::read_all([&consumer]).unwrap(),
+        )
+        .unwrap()
+        .with_preprocessor(ConservativeConsumer)
+        .compile()
+        .unwrap();
+        output.assert_success();
+        assert!(!output.is_unchanged(), "edit {value} was hidden by sparse cache eviction");
+        assert!(
+            output
+                .compiled_artifacts()
+                .artifact_files()
+                .any(|artifact| { artifact.file.ends_with("Consumer.sol/Consumer.json") })
+        );
+    }
+}
+
+#[test]
+fn optimized_import_observations_invalidate_new_consumers() {
+    #[derive(Debug)]
+    struct ReportDependencies(bool);
+
+    impl Preprocessor<MultiCompiler> for ReportDependencies {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            if self.0 && input.input.sources.contains_key(Path::new("test/Caller.sol")) {
+                state.update(
+                    paths.root.join("test/Consumer.sol"),
+                    Some(NativeDependencyState::Known(BTreeSet::from([paths
+                        .root
+                        .join("src/Dep.sol")]))),
+                );
+                state.update(
+                    paths.root.join("test/Caller.sol"),
+                    Some(NativeDependencyState::Known(BTreeSet::from([paths
+                        .root
+                        .join("test/Consumer.sol")]))),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let dependency = project
+        .add_source("Dep", "pragma solidity ^0.8.0; contract Dep { uint value = 1; }")
+        .unwrap();
+    project
+        .add_test(
+            "Consumer",
+            "pragma solidity ^0.8.0; import '../src/Dep.sol'; contract Consumer {}",
+        )
+        .unwrap();
+    let caller = project
+        .add_test(
+            "Caller",
+            "pragma solidity ^0.8.0; import './Consumer.sol'; contract Caller is Consumer {}",
+        )
+        .unwrap();
+
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ReportDependencies(false))
+        .compile()
+        .unwrap()
+        .assert_success();
+    fs::write(
+        &caller,
+        "pragma solidity ^0.8.0; import './Consumer.sol'; contract Caller is Consumer { function changed() public {} }",
+    )
+    .unwrap();
+    ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ReportDependencies(true))
+        .compile()
+        .unwrap()
+        .assert_success();
+
+    fs::write(dependency, "pragma solidity ^0.8.0; contract Dep { uint value = 2; }").unwrap();
+    let output = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ReportDependencies(false))
+        .compile()
+        .unwrap();
+    output.assert_success();
+    assert!(
+        output
+            .compiled_artifacts()
+            .artifact_files()
+            .any(|artifact| { artifact.file.ends_with("Caller.sol/Caller.json") })
+    );
+}
+
+#[test]
+fn abi_cache_preserves_filtered_context_after_ir_publication() {
+    #[derive(Debug)]
+    struct CountingPreprocessor(Arc<AtomicUsize>);
+
+    impl Preprocessor<MultiCompiler> for CountingPreprocessor {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    project.project_mut().settings.solc.optimizer.enabled = Some(false);
+    project.project_mut().update_output_selection(|selection| {
+        *selection = OutputSelection::common_output_selection(["abi".to_string()]);
+    });
+    let source = project
+        .add_source(
+            "Contract",
+            "pragma solidity ^0.8.0; contract Contract { function value() public pure returns (uint) { return 1; } }",
+        )
+        .unwrap();
+    let test = project
+        .add_test(
+            "Filtered",
+            "pragma solidity ^0.8.0; import '../src/Contract.sol'; contract FilteredTest is Contract {}",
+        )
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compile_filtered = || {
+        let output = ProjectCompiler::with_sources(
+            project.project(),
+            Source::read_all([test.clone()]).unwrap(),
+        )
+        .unwrap()
+        .with_preprocessor(CountingPreprocessor(calls.clone()))
+        .compile_abi_cached()
+        .unwrap();
+        output.assert_success();
+        output
+    };
+    assert!(!compile_filtered().is_unchanged());
+    assert!(compile_filtered().is_unchanged());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let mut output_project = project.project().clone();
+    output_project.artifacts.additional_values.ir_optimized = true;
+    output_project.artifacts.additional_values.assembly = true;
+    for cached in [false, true] {
+        for field in ["irOptimized", "evm.assembly"] {
+            // Optimized assembly inspection enables the optimizer independently of test settings.
+            output_project.settings.solc.optimizer.enabled = Some(field == "evm.assembly");
+            output_project.update_output_selection(|selection| {
+                *selection = OutputSelection::common_output_selection([
+                    "abi".to_string(),
+                    field.to_string(),
+                ]);
+            });
+            let output = ProjectCompiler::with_sources(
+                &output_project,
+                Source::read_all([source.clone()]).unwrap(),
+            )
+            .unwrap()
+            .compile_abi_cached()
+            .unwrap();
+            output.assert_success();
+            assert_eq!(output.is_unchanged(), cached);
+            let artifact = output.find_first("Contract").unwrap();
+            assert_eq!(artifact.ir_optimized.is_some(), field == "irOptimized");
+            assert_eq!(artifact.assembly.is_some(), field == "evm.assembly");
+        }
+    }
+
+    let filtered = compile_filtered();
+    assert_eq!(
+        (filtered.is_unchanged(), calls.load(Ordering::Relaxed)),
+        (true, 1),
+        "publishing native ABI + IR must not evict an unchanged filtered ABI context",
+    );
+
+    // Non-output settings changes still retire incompatible contexts for the same outputs.
+    let mut changed_settings = project.project().clone();
+    changed_settings.settings.solc.optimizer.enabled = Some(true);
+    let output =
+        ProjectCompiler::with_sources(&changed_settings, Source::read_all([source]).unwrap())
+            .unwrap()
+            .compile_abi_cached()
+            .unwrap();
+    output.assert_success();
+    assert!(!output.is_unchanged());
+    assert!(!compile_filtered().is_unchanged());
+    assert!(compile_filtered().is_unchanged());
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn abi_cache_separates_artifact_value_settings() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    project.project_mut().update_output_selection(|selection| {
+        *selection = OutputSelection::common_output_selection([
+            "abi".to_string(),
+            "irOptimized".to_string(),
+        ]);
+    });
+    project.add_source("Contract", "pragma solidity ^0.8.0; contract Contract {}").unwrap();
+
+    for (retain_ir, cached) in [(false, false), (true, false), (false, true), (true, true)] {
+        project.project_mut().artifacts.additional_values.ir_optimized = retain_ir;
+        let output = ProjectCompiler::new(project.project()).unwrap().compile_abi_cached().unwrap();
+        output.assert_success();
+        assert_eq!(output.is_unchanged(), cached);
+        assert_eq!(output.find_first("Contract").unwrap().ir_optimized.is_some(), retain_ir);
     }
 }
 
@@ -1135,6 +1927,206 @@ fn can_compile_dapp_detect_changes_in_libs() {
     assert!(compiled.find_first("Bar").is_some());
     // ensure change is detected
     assert!(!compiled.is_unchanged());
+}
+
+#[test]
+fn can_compile_dapp_detect_changes_in_resolved_imports() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let lib = project.paths().libraries[0].clone();
+    project
+        .paths_mut()
+        .remappings
+        .push(Remapping::from_str(&format!("@dep/={}/", lib.join("a").display())).unwrap());
+
+    project
+        .add_source(
+            "UsesDep",
+            r#"
+    pragma solidity ^0.8.10;
+    import {Impl} from "@dep/Impl.sol";
+
+    contract UsesDep { function value() external returns (uint256) { return new Impl().value(); } }
+   "#,
+        )
+        .unwrap();
+    project
+        .add_source(
+            "KeepDeps",
+            r#"
+    pragma solidity ^0.8.10;
+    import {Impl as A} from "../lib/a/Impl.sol";
+    import {Impl as B} from "../lib/b/Impl.sol";
+
+    contract KeepDeps { function keep(A, B) external pure {} }
+   "#,
+        )
+        .unwrap();
+    project
+        .add_lib(
+            "a/Impl",
+            r#"
+    pragma solidity ^0.8.10;
+    contract Impl { function value() external pure returns (uint256) { return 1; } }
+   "#,
+        )
+        .unwrap();
+    project
+        .add_lib(
+            "b/Impl",
+            r#"
+    pragma solidity ^0.8.10;
+    contract Impl { function value() external pure returns (uint256) { return 2; } }
+   "#,
+        )
+        .unwrap();
+
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+    assert!(project.compile().unwrap().is_unchanged());
+
+    project.paths_mut().remappings[0] =
+        Remapping::from_str(&format!("@dep/={}/", lib.join("b").display())).unwrap();
+
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+
+    let cache = CompilerCache::<SolcSettings>::read(project.cache_path()).unwrap();
+    assert_eq!(
+        cache.files[Path::new("src/UsesDep.sol")].imports,
+        BTreeSet::from([PathBuf::from("lib/b/Impl.sol")])
+    );
+}
+
+#[test]
+fn can_compile_dapp_invalidate_changed_cached_imports() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.add_source("Dep", "pragma solidity ^0.8.10; contract Dep {}").unwrap();
+    project
+        .add_source(
+            "UsesDep",
+            "pragma solidity ^0.8.10; import './Dep.sol'; contract UsesDep is Dep {}",
+        )
+        .unwrap();
+    project.add_source("Unrelated", "pragma solidity ^0.8.10; contract Unrelated {}").unwrap();
+    project.compile().unwrap().assert_success();
+    assert!(project.compile().unwrap().is_unchanged());
+
+    let expected = BTreeSet::from([PathBuf::from("src/Dep.sol")]);
+    for imports in [
+        BTreeSet::new(),
+        BTreeSet::from([PathBuf::from("src/Unrelated.sol")]),
+        BTreeSet::from([PathBuf::from("src/Dep.sol"), PathBuf::from("src/Unrelated.sol")]),
+    ] {
+        let mut cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+        let entry = cache.files.get_mut(Path::new("src/UsesDep.sol")).unwrap();
+        assert_eq!(entry.imports, expected);
+        // Leave source contents, artifacts, settings, and remappings unchanged.
+        entry.imports = imports;
+        cache.write(project.cache_path()).unwrap();
+
+        let compiled = project.compile().unwrap();
+        compiled.assert_success();
+        assert!(!compiled.is_unchanged());
+        assert!(compiled.compiled_artifacts().find_first("UsesDep").is_some());
+        assert!(compiled.compiled_artifacts().find_first("Unrelated").is_none());
+        assert!(compiled.cached_artifacts().find_first("Unrelated").is_some());
+
+        let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+        assert_eq!(cache.files[Path::new("src/UsesDep.sol")].imports, expected);
+        let unchanged = project.compile().unwrap();
+        unchanged.assert_success();
+        assert!(unchanged.is_unchanged());
+    }
+}
+
+#[test]
+fn can_compile_dapp_detect_swapped_remapping_bindings() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let lib = project.paths().libraries[0].clone();
+    project.paths_mut().remappings.extend([
+        Remapping::from_str(&format!("@first/={}/", lib.join("a").display())).unwrap(),
+        Remapping::from_str(&format!("@second/={}/", lib.join("b").display())).unwrap(),
+    ]);
+
+    project
+        .add_source(
+            "UsesDeps",
+            r#"
+    pragma solidity ^0.8.10;
+    import {Impl as First} from "@first/Impl.sol";
+    import {Impl as Second} from "@second/Impl.sol";
+
+    contract UsesDeps {
+        function first() external returns (uint256) { return new First().value(); }
+        function second() external returns (uint256) { return new Second().value(); }
+    }
+   "#,
+        )
+        .unwrap();
+    project
+        .add_lib(
+            "a/Impl",
+            r#"
+    pragma solidity ^0.8.10;
+    contract Impl { function value() external pure returns (uint256) { return 1; } }
+   "#,
+        )
+        .unwrap();
+    project
+        .add_lib(
+            "b/Impl",
+            r#"
+    pragma solidity ^0.8.10;
+    contract Impl { function value() external pure returns (uint256) { return 2; } }
+   "#,
+        )
+        .unwrap();
+
+    project.compile().unwrap().assert_success();
+    assert!(project.compile().unwrap().is_unchanged());
+
+    project.paths_mut().remappings.swap(0, 1);
+
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+}
+
+#[test]
+fn can_remove_build_infos_of_invalidated_cache() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.project_mut().build_info = true;
+    project.add_source("A", "pragma solidity ^0.8.10; contract A {}").unwrap();
+
+    let build_infos = |project: &TempProject<MultiCompiler>| {
+        fs::read_dir(project.project().build_info_path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path().file_stem().unwrap().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>()
+    };
+
+    project.compile().unwrap().assert_success();
+    let initial = build_infos(&project);
+    assert_eq!(initial.len(), 1);
+
+    // An unused remapping, such as one discovered in a newly installed library, invalidates the
+    // cache and changes the compiler input.
+    let lib = project.paths().libraries[0].join("dep");
+    project
+        .paths_mut()
+        .remappings
+        .push(Remapping::from_str(&format!("@dep/={}/", lib.display())).unwrap());
+    let compiled = project.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    let current = build_infos(&project);
+    assert_eq!(current, cache.builds);
+    assert_eq!(current.len(), 1);
+    assert!(current.is_disjoint(&initial));
 }
 
 #[test]
@@ -3509,6 +4501,83 @@ fn can_detect_invalid_version() {
 }
 
 #[test]
+fn solar_resolves_mixed_exact_pragmas() {
+    let mut tmp = TempProject::<MultiCompiler>::dapptools().unwrap();
+    tmp.add_source("A", "pragma solidity =0.8.19; contract A {}").unwrap();
+    tmp.add_source("B", "pragma solidity =0.8.28; contract B {}").unwrap();
+
+    let solar = Version::parse("0.8.38+commit.3a70399.solar.0.2.0").unwrap();
+    tmp.project_mut().compiler.solc =
+        Some(SolcCompiler::Specific(Solc::new_with_version("/nonexistent/solar", solar)));
+    let graph = Graph::<MultiCompilerParser>::resolve(tmp.paths()).unwrap();
+    let resolved = graph.into_sources_by_version(tmp.project()).unwrap();
+    let mut versions = resolved
+        .sources
+        .values()
+        .flatten()
+        .map(|(version, ..)| version.to_string())
+        .collect::<Vec<_>>();
+    versions.sort();
+    assert_eq!(
+        versions,
+        ["0.8.19+commit.3a70399.solar.0.2.0", "0.8.28+commit.3a70399.solar.0.2.0"]
+    );
+
+    // A solc binary still serves only its own version.
+    tmp.project_mut().compiler.solc = Some(SolcCompiler::Specific(Solc::new_with_version(
+        "/nonexistent/solc",
+        Version::new(0, 8, 38),
+    )));
+    let graph = Graph::<MultiCompilerParser>::resolve(tmp.paths()).unwrap();
+    assert!(graph.into_sources_by_version(tmp.project()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn switching_from_solc_to_solar_recompiles() {
+    let solc = Solc::find_or_install(&Version::new(0, 8, 19)).unwrap();
+    let mut tmp = TempProject::<MultiCompiler>::dapptools().unwrap();
+    tmp.add_source("A", "pragma solidity =0.8.19; contract A {}").unwrap();
+    tmp.project_mut().compiler.solc = Some(SolcCompiler::Specific(solc.clone()));
+    tmp.compile().unwrap().assert_success();
+
+    // Stands in for Solar: it reports a Solar version and compiles with the same solc.
+    let solar = tmp.root().join("solar");
+    fs::write(
+        &solar,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n*--version*) echo 'Version: 0.8.37+commit.3a70399.solar.0.2.0';;\n*) exec '{}' \"$@\";;\nesac\n",
+            solc.solc.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&solar, fs::Permissions::from_mode(0o755)).unwrap();
+    tmp.project_mut().compiler.solc = Some(SolcCompiler::Specific(Solc::new(&solar).unwrap()));
+    let compiled = tmp.compile().unwrap();
+    compiled.assert_success();
+    assert!(!compiled.is_unchanged());
+}
+
+#[cfg(unix)]
+#[test]
+fn solar_reports_solc_version_under_any_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Stands in for Solar installed as `solc`: like Solar, it prints its native version unless
+    // `SOLC_WRAPPER=1` is set.
+    let solar = tmp.path().join("solc");
+    fs::write(
+        &solar,
+        "#!/bin/sh\nif [ \"$SOLC_WRAPPER\" = 1 ]; then\necho 'solar the Solidity compiler'\necho 'Version: 0.8.37+commit.82e7755.solar.0.2.0'\nelse\necho 'solar Version: 0.2.0'\necho 'Build Profile: dist'\nfi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&solar, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        Solc::new(&solar).unwrap().version,
+        Version::parse("0.8.37+commit.82e7755.solar.0.2.0").unwrap()
+    );
+}
+
+#[test]
 fn test_severity_warnings() {
     let mut tmp = TempProject::<MultiCompiler>::dapptools().unwrap();
     // also treat warnings as error
@@ -5653,6 +6722,144 @@ fn can_preprocess() {
 }
 
 #[test]
+fn preprocessor_version_invalidates_cache() {
+    #[derive(Debug)]
+    struct VersionedPreprocessor(u64);
+
+    impl Preprocessor<MultiCompiler> for VersionedPreprocessor {
+        fn cache_version(&self) -> u64 {
+            self.0
+        }
+
+        fn preprocess(
+            &self,
+            _compiler: &MultiCompiler,
+            _input: &mut MultiCompilerInput,
+            _paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _mocks: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.add_source("Contract.sol", "pragma solidity ^0.8.0; contract Contract {}").unwrap();
+
+    let compile = |version| {
+        ProjectCompiler::new(project.project())
+            .unwrap()
+            .with_preprocessor(VersionedPreprocessor(version))
+            .compile()
+            .unwrap()
+    };
+
+    assert!(!compile(1).is_unchanged());
+    assert!(compile(1).is_unchanged());
+    assert!(!compile(2).is_unchanged());
+    assert!(compile(2).is_unchanged());
+
+    project.add_source("Added", "pragma solidity ^0.8.0; contract Added {}").unwrap();
+    let output = compile(2);
+    output.assert_success();
+    assert_eq!(output.compiled_artifacts().artifact_files().count(), 2);
+    assert!(compile(2).is_unchanged());
+}
+
+#[test]
+fn build_context_maps_preprocessed_offsets() {
+    const SOURCE: &str = "pragma solidity ^0.8.0;\ncontract First { function f() public pure returns (uint) { return 1; } }\ncontract Second {}\n";
+
+    #[derive(Debug)]
+    struct EditingPreprocessor;
+
+    impl Preprocessor<MultiCompiler> for EditingPreprocessor {
+        fn preprocess(
+            &self,
+            _: &MultiCompiler,
+            _: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn preprocess_with_dependencies(
+            &self,
+            _: &MultiCompiler,
+            input: &mut MultiCompilerInput,
+            _: &ProjectPathsConfig<MultiCompilerLanguage>,
+            _: &mut HashSet<PathBuf>,
+            state: &mut PreprocessorState,
+            _: &[PathBuf],
+        ) -> Result<()> {
+            let MultiCompilerInput::Solc(input) = input else { return Ok(()) };
+            let start = SOURCE.find("1;").unwrap();
+            let updates = Updates::from([(
+                PathBuf::from("test/Edited.sol"),
+                BTreeSet::from([
+                    (start, start + 1, "1 + 2 + 3".to_string()),
+                    (SOURCE.len(), SOURCE.len(), "contract Appended {}\n".to_string()),
+                ]),
+            )]);
+            apply_updates(&mut input.input.sources, updates.clone());
+            state.record_source_updates(&updates);
+            Ok(())
+        }
+    }
+
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.project_mut().update_output_selection(|selection| {
+        selection
+            .0
+            .entry("*".to_string())
+            .or_default()
+            .insert(String::new(), vec!["ast".to_string()]);
+    });
+    let path = project.add_test("Edited", SOURCE).unwrap();
+    let compile = || {
+        let output = ProjectCompiler::new(project.project())
+            .unwrap()
+            .with_preprocessor(EditingPreprocessor)
+            .compile()
+            .unwrap();
+        output.assert_success();
+        output
+    };
+    let edits = |output: &ProjectCompileOutput<MultiCompiler>| {
+        let (_, build) = output.builds().next().unwrap();
+        let (id, _) = build.source_id_to_path.iter().find(|(_, p)| **p == path).unwrap();
+        build.source_edits[id].clone()
+    };
+
+    let compiled = compile();
+    let start = SOURCE.find("1;").unwrap();
+    let expected = vec![
+        SourceEdit { start, end: start + 1, len: 9 },
+        SourceEdit { start: SOURCE.len(), end: SOURCE.len(), len: 21 },
+    ];
+    assert_eq!(edits(&compiled), expected);
+
+    // Solc reports locations in the edited source.
+    let ast = compiled.find_first("Second").unwrap().ast.as_ref().unwrap();
+    let second = ast
+        .nodes
+        .iter()
+        .find(|node| node.other.get("name").is_some_and(|name| name == "Second"))
+        .unwrap();
+    let compiled_start = second.src.start;
+    assert_eq!(compiled_start, SOURCE.find("contract Second").unwrap() + 8);
+    assert_eq!(
+        SourceEdit::original_offset(&expected, compiled_start),
+        SOURCE.find("contract Second").unwrap()
+    );
+
+    // Cached builds are read back from the build info.
+    let cached = compile();
+    assert!(cached.is_unchanged());
+    assert_eq!(edits(&cached), expected);
+}
+
+#[test]
 fn build_info_uses_filesystem_content_for_preprocessed_source_alias() {
     const DISK_SOURCE: &str = r#"// disk source
 pragma solidity 0.8.26;
@@ -6115,4 +7322,929 @@ contract Test is PBTSimple {
             "standard_json_input should compile without errors: {compiler_errors:?}"
         );
     }
+}
+
+#[test]
+fn can_flatten_aliased_errors_and_events() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    for source in ["First", "Second"] {
+        project
+            .add_source(source, "pragma solidity ^0.8.22; error Failure(); event Success();")
+            .unwrap();
+    }
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+import {Failure as FirstFailure, Success as FirstSuccess} from "./First.sol";
+import {Failure as SecondFailure, Success as SecondSuccess} from "./Second.sol";
+contract Target {
+    function run(bool first) external {
+        if (first) {
+            emit FirstSuccess();
+            revert FirstFailure();
+        }
+        emit SecondSuccess();
+        revert SecondFailure();
+    }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_abi = original.find_first("Target").unwrap().abi.clone();
+    let result = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let flattened = project.add_source("Flattened", result).unwrap();
+    let compiled = project.project().compile_file(flattened).unwrap();
+    compiled.assert_success();
+    assert_eq!(original_abi, compiled.find_first("Target").unwrap().abi);
+}
+
+#[test]
+fn can_flatten_with_existing_renamed_identifier() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project
+        .add_source("First", "pragma solidity ^0.8.15; contract Token {} contract Token_0 {}")
+        .unwrap();
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.15;
+import {Token as FirstToken, Token_0} from "./First.sol";
+contract Token {}
+contract Target is FirstToken, Token, Token_0 {}
+"#,
+        )
+        .unwrap();
+    let result = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let flattened = project.add_source("Flattened", result).unwrap();
+    project.project().compile_file(flattened).unwrap().assert_success();
+}
+
+#[test]
+#[ignore = "set FLATTEN_CORPUS to a JSON manifest of roots, remappings, settings, solc, and targets"]
+fn can_flatten_contract_corpus() {
+    let manifest = PathBuf::from(env::var("FLATTEN_CORPUS").unwrap());
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let mut results = Vec::new();
+    for entry in entries {
+        let root = PathBuf::from(entry["root"].as_str().unwrap());
+        let paths = ProjectPathsConfig::builder()
+            .root(&root)
+            .libs([root.join("lib"), root.join("node_modules")])
+            .remappings(
+                entry["remappings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.as_str().unwrap().parse::<Remapping>().unwrap()),
+            )
+            .build()
+            .unwrap();
+        let mut compiler = MultiCompiler::default();
+        if let Some(version) = entry["solc"].as_str() {
+            compiler.solc = Some(SolcCompiler::Specific(
+                Solc::find_or_install(&version.parse().unwrap()).unwrap(),
+            ));
+        }
+        let mut project =
+            Project::builder().paths(paths).ephemeral().no_artifacts().build(compiler).unwrap();
+        project.settings.solc.settings = serde_json::from_value(entry["settings"].clone()).unwrap();
+        project.settings.solc.output_selection = OutputSelection::ast_output_selection();
+        let output = tempfile::tempdir_in(&root).unwrap();
+        let mut targets = entry["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| root.join(target.as_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty());
+        if entry["aggregate"].as_bool().unwrap_or_default() {
+            let imports = targets
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    format!(
+                        "import * as Source{i} from \"{}\";\n",
+                        path.strip_prefix(&root).unwrap().display()
+                    )
+                })
+                .collect::<String>();
+            let aggregate = output.path().join("Aggregate.sol");
+            fs::write(
+                &aggregate,
+                format!("pragma solidity {};\n{imports}", entry["solc"].as_str().unwrap()),
+            )
+            .unwrap();
+            targets = vec![aggregate];
+        }
+        for target in targets {
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let flattener = match Flattener::new(project.clone(), &target) {
+                    Ok(flattener) => flattener,
+                    Err(err) => {
+                        let status = match project.compile_file(&target) {
+                            Ok(output) if !output.has_compiler_errors() => "setup",
+                            _ => "input",
+                        };
+                        return (status, err.to_string());
+                    }
+                };
+                let flattened = flattener.flatten();
+                let path = output.path().join("Flattened.sol");
+                fs::write(&path, &flattened).unwrap();
+                match project.compile_file(&path) {
+                    Ok(compiled) if !compiled.has_compiler_errors() => ("ok", String::new()),
+                    result => {
+                        fs::write(
+                            manifest.parent().unwrap().join(format!(
+                                "{}-failure-{}.sol",
+                                root.file_name().unwrap().to_string_lossy(),
+                                results.len()
+                            )),
+                            flattened,
+                        )
+                        .unwrap();
+                        (
+                            "output",
+                            match result {
+                                Ok(compiled) => compiled.to_string(),
+                                Err(err) => err.to_string(),
+                            },
+                        )
+                    }
+                }
+            }));
+            let (status, error) = attempt.unwrap_or_else(|err| {
+                (
+                    "panic",
+                    err.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                )
+            });
+            eprintln!("{status}: {}", target.display());
+            results.push(serde_json::json!({"target":target,"status":status,"error":error}));
+        }
+    }
+    fs::write(
+        manifest.with_extension("results.json"),
+        serde_json::to_vec_pretty(&results).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        results.iter().all(|result| result["status"] == "ok"),
+        "see {}",
+        manifest.with_extension("results.json").display()
+    );
+}
+
+#[test]
+fn can_flatten_legacy_type_references() {
+    for version in ["0.5.17", "0.6.12", "0.7.6"] {
+        let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.add_source("First", format!("pragma solidity {version}; contract Kind {{ struct Item {{ uint value; }} enum State {{ A }} }}")).unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity {version};
+import {{Kind as Alias}} from "./First.sol";
+contract Kind {{}}
+contract Target is Alias {{
+    function run(Alias first) public pure returns (Alias) {{
+        Alias.Item memory item = Alias.Item(1);
+        Alias.State state = Alias.State.A;
+        return first;
+    }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let result = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let flattened = project.add_source("Flattened", result).unwrap();
+        project.project().compile_file(flattened).unwrap().assert_success();
+    }
+}
+
+#[test]
+fn can_flatten_overloaded_events_without_changing_abi() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+/// @param value The number.
+event Notice(uint256 indexed value);
+/// @param value The address.
+event Notice(address value) anonymous;
+contract Notice_0 {}
+contract Target {
+    function run() external {
+        emit Notice(uint256(1));
+        emit Notice(address(1));
+    }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_abi = original.find_first("Target").unwrap().abi.clone();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    let compiled = project.project().compile_file(path).unwrap();
+    compiled.assert_success();
+    assert_eq!(original_abi, compiled.find_first("Target").unwrap().abi);
+}
+
+#[test]
+fn can_flatten_legacy_error_signatures() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    for name in ["First", "Second"] {
+        project
+            .add_source(
+                name,
+                r#"pragma solidity 0.8.4;
+struct Value { uint256 number; }
+/// @param value The failing value.
+error Failure(Value value);
+"#,
+            )
+            .unwrap();
+    }
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity 0.8.4;
+import {Failure as FirstFailure, Value as FirstValue} from "./First.sol";
+import {Failure as SecondFailure, Value as SecondValue} from "./Second.sol";
+contract Target {
+    function run(bool first) external pure {
+        if (first) revert FirstFailure(FirstValue(1));
+        revert SecondFailure(SecondValue(2));
+    }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_abi = original.find_first("Target").unwrap().abi.clone();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    let compiled = project.project().compile_file(path).unwrap();
+    compiled.assert_success();
+    let abi = compiled.find_first("Target").unwrap().abi.as_ref().unwrap();
+    assert_eq!(
+        original_abi
+            .unwrap()
+            .errors
+            .values()
+            .flatten()
+            .map(|error| error.signature())
+            .collect::<Vec<_>>(),
+        abi.errors.values().flatten().map(|error| error.signature()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn can_flatten_singleton_errors_and_events_with_member_names() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project
+        .add_source(
+            "Declarations",
+            "pragma solidity ^0.8.22; error Failure(uint256 value); event Notice(uint256 value);",
+        )
+        .unwrap();
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+import {Failure as ImportedFailure, Notice as ImportedNotice} from "./Declarations.sol";
+contract Base {
+    error Failure(uint128 value);
+    event Notice(uint128 value);
+}
+contract Target is Base {
+    function run() external {
+        emit ImportedNotice(1);
+        revert ImportedFailure(1);
+    }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_abi = original.find_first("Target").unwrap().abi.clone();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    let compiled = project.project().compile_file(path).unwrap();
+    compiled.assert_success();
+    assert_eq!(original_abi, compiled.find_first("Target").unwrap().abi);
+}
+
+#[test]
+fn can_flatten_errors_and_events_with_shadowed_namespace_names() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    for name in ["First", "Second"] {
+        project
+            .add_source(name, "pragma solidity ^0.8.22; error Failure(); event Notice();")
+            .unwrap();
+    }
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+import {Failure as FirstFailure, Notice as FirstNotice} from "./First.sol";
+import {Failure as SecondFailure, Notice as SecondNotice} from "./Second.sol";
+contract Base {
+    uint256 internal Notice_0;
+    uint256 internal Failure_0;
+}
+contract Target is Base {
+    function run(bool first, uint256 Notice_1, uint256 Failure_1) external {
+        uint256 Notice_2 = Notice_1;
+        uint256 Failure_2 = Failure_1;
+        if (first) {
+            emit FirstNotice();
+            revert FirstFailure();
+        }
+        emit SecondNotice();
+        revert SecondFailure();
+    }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_abi = original.find_first("Target").unwrap().abi.clone();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    let compiled = project.project().compile_file(path).unwrap();
+    compiled.assert_success();
+    assert_eq!(original_abi, compiled.find_first("Target").unwrap().abi);
+}
+
+#[test]
+fn can_flatten_singleton_value_alias_shadowing() {
+    for (declaration, member, expression) in [
+        ("uint256 constant value = 7;", "uint256 constant value = 9;", "original"),
+        (
+            "function value() pure returns (uint256) { return 7; }",
+            "function value() internal pure returns (uint256) { return 9; }",
+            "original()",
+        ),
+        (
+            "function value() pure returns (uint256) { return 7; }",
+            "modifier value() { _; }",
+            "original()",
+        ),
+    ] {
+        let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.project_mut().settings.solc.metadata = Some(BytecodeHash::None.into());
+        project
+            .add_source("Declaration", format!("pragma solidity ^0.8.22; {declaration}"))
+            .unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity ^0.8.22;
+import {{value as original}} from "./Declaration.sol";
+contract Target {{
+    {member}
+    function run() external pure returns (uint256) {{ return {expression}; }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let original = project.project().compile_file(&target).unwrap();
+        original.assert_success();
+        let original_code = original
+            .find_first("Target")
+            .unwrap()
+            .get_deployed_bytecode_bytes()
+            .unwrap()
+            .into_owned();
+        let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let path = project.add_source("Flattened", flattened).unwrap();
+        let compiled = project.project().compile_file(path).unwrap();
+        compiled.assert_success();
+        assert_eq!(
+            original_code,
+            compiled
+                .find_first("Target")
+                .unwrap()
+                .get_deployed_bytecode_bytes()
+                .unwrap()
+                .into_owned(),
+            "{declaration}"
+        );
+    }
+}
+
+#[test]
+fn can_flatten_singleton_type_alias_shadowing() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project
+        .add_source("Declaration", "pragma solidity ^0.8.22; struct Value { uint256 original; }")
+        .unwrap();
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+import {Value as OriginalValue} from "./Declaration.sol";
+contract Target {
+    struct Value { uint256 different; }
+    function run() external pure returns (uint256) {
+        OriginalValue memory data = OriginalValue({original: 7});
+        return data.original;
+    }
+}
+"#,
+        )
+        .unwrap();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    project.project().compile_file(path).unwrap().assert_success();
+}
+
+#[test]
+fn can_flatten_qualified_import_with_trivia() {
+    for reference in [
+        "Namespace.Inner.Failure",
+        "Namespace /* . */ . Inner // .\n . Failure",
+        "Namespace /* λ. */ . /* Inner. */ Inner . /* Failure. */ Failure",
+        "Namespace\n . Inner\r\n . Failure",
+    ] {
+        let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.add_source("Declaration", "pragma solidity ^0.8.22; error Failure();").unwrap();
+        project
+            .add_source(
+                "Reexport",
+                r#"pragma solidity ^0.8.22; import * as Inner from "./Declaration.sol";"#,
+            )
+            .unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity ^0.8.22;
+import * as Namespace from "./Reexport.sol";
+contract Target {{
+    function run() external pure {{
+        revert {reference}();
+    }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let path = project.add_source("Flattened", flattened).unwrap();
+        project.project().compile_file(path).unwrap().assert_success();
+    }
+}
+
+#[test]
+fn can_flatten_singleton_alias_in_local_scope() {
+    for (parameters, statement) in [("uint256 value", ""), ("", "uint256 value = 9;")] {
+        let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.project_mut().settings.solc.metadata = Some(BytecodeHash::None.into());
+        project
+            .add_source("Declaration", "pragma solidity ^0.8.22; uint256 constant value = 7;")
+            .unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity ^0.8.22;
+import {{value as original}} from "./Declaration.sol";
+contract Target {{
+    function run({parameters}) external pure returns (uint256) {{
+        {statement}
+        return original;
+    }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let original = project.project().compile_file(&target).unwrap();
+        original.assert_success();
+        let original_code = original
+            .find_first("Target")
+            .unwrap()
+            .get_deployed_bytecode_bytes()
+            .unwrap()
+            .into_owned();
+        let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let path = project.add_source("Flattened", flattened).unwrap();
+        let compiled = project.project().compile_file(path).unwrap();
+        compiled.assert_success();
+        assert_eq!(
+            original_code,
+            compiled
+                .find_first("Target")
+                .unwrap()
+                .get_deployed_bytecode_bytes()
+                .unwrap()
+                .into_owned()
+        );
+    }
+}
+
+#[test]
+fn can_flatten_preserve_contract_type_name() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.project_mut().settings.solc.optimizer.enabled = Some(true);
+    project.project_mut().settings.solc.metadata = Some(BytecodeHash::None.into());
+    project.add_source("First", "pragma solidity ^0.8.22; contract Token {}").unwrap();
+    project.add_source("Second", "pragma solidity ^0.8.22; contract Token {}").unwrap();
+    let target = project
+        .add_source(
+            "Target",
+            r#"pragma solidity ^0.8.22;
+import {Token as FirstToken} from "./First.sol";
+import * as Second from "./Second.sol";
+contract Target {
+    function first() external pure returns (string memory) { return type(FirstToken).name; }
+    function second() external pure returns (string memory) { return type(Second.Token).name; }
+    function choose(string memory) internal pure returns (uint256) { return 1; }
+    function choose(bytes32) internal pure returns (uint256) { return 2; }
+    function overloaded() external pure returns (uint256) { return choose(type(Second.Token).name); }
+}
+"#,
+        )
+        .unwrap();
+    let original = project.project().compile_file(&target).unwrap();
+    original.assert_success();
+    let original_code =
+        original.find_first("Target").unwrap().get_deployed_bytecode_bytes().unwrap().into_owned();
+    let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    let path = project.add_source("Flattened", flattened).unwrap();
+    let compiled = project.project().compile_file(path).unwrap();
+    compiled.assert_success();
+    assert_eq!(
+        original_code,
+        compiled.find_first("Target").unwrap().get_deployed_bytecode_bytes().unwrap().into_owned()
+    );
+}
+
+#[test]
+fn can_flatten_singleton_alias_in_assembly_scope() {
+    for assembly in [
+        "let value := 9 result := add(original, value)",
+        "{ let value := 9 result := add(original, value) }",
+        "if original { let value := 9 result := add(original, value) }",
+        "switch original case 7 { let value := 9 result := add(original, value) } default { result := original }",
+        "for { let value := 0 } lt(value, 1) { value := add(value, 1) } { result := add(original, value) }",
+        "for { let i := 0 } lt(i, 1) { let value := original i := add(i, value) } { let value := 9 result := add(original, value) }",
+        "function value() -> r { r := original } result := value()",
+        "function f(value) -> r { r := add(original, value) } result := f(9)",
+        "function f() -> value { value := original } result := f()",
+        "let value := 9 let value_0 := 11 result := add(original, add(value, value_0))",
+        "let value let value_0 let value_1 result := original",
+        "function value() {} result := original",
+        "function f(value) -> out { out := original } result := f(9)",
+        "function f() -> value { value := original leave } result := f()",
+        "function f() -> value, value_0 { value := original value_0 := 9 } let a, b := f() result := add(a, b)",
+        "let value := 9 switch original case 7 { result := original } default { let value_0 result := add(original, value) }",
+        "for { let value := 0 } lt(value, 3) { value := add(value, 1) } { if eq(value, 0) { continue } result := original break }",
+    ] {
+        let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.project_mut().settings.solc.metadata = Some(BytecodeHash::None.into());
+        project
+            .add_source("Declaration", "pragma solidity ^0.8.22; uint256 constant value = 7;")
+            .unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity ^0.8.22;
+import {{value as original}} from "./Declaration.sol";
+contract Target {{
+    function run() external pure returns (uint256 result) {{
+        assembly {{
+            {assembly}
+        }}
+    }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let original = project.project().compile_file(&target).unwrap();
+        original.assert_success();
+        let original_code = original
+            .find_first("Target")
+            .unwrap()
+            .get_deployed_bytecode_bytes()
+            .unwrap()
+            .into_owned();
+        let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let path = project.add_source("Flattened", flattened).unwrap();
+        let compiled = project.project().compile_file(path).unwrap();
+        compiled.assert_success();
+        assert_eq!(
+            original_code,
+            compiled
+                .find_first("Target")
+                .unwrap()
+                .get_deployed_bytecode_bytes()
+                .unwrap()
+                .into_owned()
+        );
+    }
+}
+
+#[test]
+fn can_flatten_builtin_aliases() {
+    for (name, body) in [
+        ("add", "assembly { result := original }"),
+        ("mload", "assembly { result := original }"),
+        ("gas", "assembly { result := original }"),
+        ("block", "result = original + block.number;"),
+        ("msg", "result = original + msg.value;"),
+        ("block", "result = block.number;"),
+        ("msg", "result = msg.value;"),
+    ] {
+        let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project.project_mut().settings.solc.metadata = Some(BytecodeHash::None.into());
+        project
+            .add_source(
+                "Declaration",
+                format!("pragma solidity ^0.8.22; uint256 constant {name} = 7;"),
+            )
+            .unwrap();
+        let target = project
+            .add_source(
+                "Target",
+                format!(
+                    r#"pragma solidity ^0.8.22;
+import {{{name} as original}} from "./Declaration.sol";
+contract Target {{
+    function run() external payable returns (uint256 result) {{ {body} }}
+}}
+"#
+                ),
+            )
+            .unwrap();
+        let original = project.project().compile_file(&target).unwrap();
+        original.assert_success();
+        let original_code = original
+            .find_first("Target")
+            .unwrap()
+            .get_deployed_bytecode_bytes()
+            .unwrap()
+            .into_owned();
+        let flattened = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+        let path = project.add_source("Flattened", flattened).unwrap();
+        let compiled = project.project().compile_file(path).unwrap();
+        compiled.assert_success();
+        assert_eq!(
+            original_code,
+            compiled
+                .find_first("Target")
+                .unwrap()
+                .get_deployed_bytecode_bytes()
+                .unwrap()
+                .into_owned(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn can_flatten_spdx_string_literal() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+
+    project
+        .add_source(
+            "A",
+            r#"pragma solidity ^0.8.10;
+contract A {
+    event Message(string value);
+    function a() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#,
+        )
+        .unwrap();
+
+    let target = project
+        .add_source(
+            "B",
+            r#"pragma solidity ^0.8.10;
+import "./A.sol";
+contract B is A {
+    function b() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#,
+        )
+        .unwrap();
+
+    test_flatteners(&project, &target, |result| {
+        assert_eq!(
+            result,
+            r#"pragma solidity ^0.8.10;
+
+// src/A.sol
+
+contract A {
+    event Message(string value);
+    function a() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+
+// src/B.sol
+
+contract B is A {
+    function b() external { emit Message("SPDX-License-Identifier: MIT"); }
+}
+"#
+        );
+    });
+}
+
+#[test]
+fn can_flatten_spdx_comment_on_code_line() {
+    let project = TempProject::<MultiCompiler>::dapptools().unwrap();
+
+    project
+        .add_source(
+            "A",
+            r"pragma solidity ^0.8.10;
+contract A {} // SPDX-License-Identifier: MIT
+",
+        )
+        .unwrap();
+
+    // Comments inside top-level nodes are not file-level license identifiers.
+    project
+        .add_source(
+            "C",
+            r"pragma /* SPDX-License-Identifier: MIT */ solidity ^0.8.10;
+contract/* SPDX-License-Identifier: MIT */C {}
+",
+        )
+        .unwrap();
+
+    let target = project
+        .add_source(
+            "B",
+            r#"/* SPDX-License-Identifier: MIT */ pragma solidity ^0.8.10; import "./A.sol"; import "./C.sol"; contract B is A, C {}
+"#,
+        )
+        .unwrap();
+
+    let result = Flattener::new(project.project().clone(), &target).unwrap().flatten();
+    assert_eq!(
+        result,
+        "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.10;\n\n// src/A.sol\n\ncontract A {} \n\n// src/C.sol\n\ncontract/* SPDX-License-Identifier: MIT */C {}\n\n// src/B.sol\n    contract B is A, C {}\n"
+    );
+    let flattened = project.add_source("Flattened", result).unwrap();
+    project.project().compile_file(flattened).unwrap().assert_success();
+}
+
+#[derive(Debug)]
+struct ContextSensitivePreprocessor;
+
+impl Preprocessor<MultiCompiler> for ContextSensitivePreprocessor {
+    fn preprocess(
+        &self,
+        _compiler: &MultiCompiler,
+        _input: &mut MultiCompilerInput,
+        _paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+        _mocks: &mut HashSet<PathBuf>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn preprocess_with_dependencies(
+        &self,
+        _compiler: &MultiCompiler,
+        input: &mut MultiCompilerInput,
+        _paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+        _mocks: &mut HashSet<PathBuf>,
+        _state: &mut PreprocessorState,
+        source_units: &[PathBuf],
+    ) -> Result<()> {
+        if let MultiCompilerInput::Solc(input) = input
+            && source_units.iter().any(|path| path == Path::new("src/Added.sol"))
+            && let Some(source) = input.input.sources.get_mut(Path::new("test/Sensitive.t.sol"))
+        {
+            source.content = source.content.replace("return 1;", "return 2;").into();
+        }
+        Ok(())
+    }
+
+    fn is_source_context_sensitive(
+        &self,
+        source: &Path,
+        paths: &ProjectPathsConfig<MultiCompilerLanguage>,
+    ) -> bool {
+        paths.is_test_or_script(source)
+    }
+}
+
+#[test]
+fn preprocessor_context_growth_preserves_insensitive_sources() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    for i in 0..5 {
+        project
+            .add_source(&format!("C{i}"), format!("pragma solidity ^0.8.0; contract C{i} {{}}"))
+            .unwrap();
+    }
+    let compile = || {
+        ProjectCompiler::new(project.project())
+            .unwrap()
+            .with_preprocessor(ContextSensitivePreprocessor)
+            .compile()
+            .unwrap()
+    };
+    let output = compile();
+    output.assert_success();
+    assert_eq!(output.compiled_artifacts().artifact_files().count(), 5);
+
+    project.add_test("Sensitive.t.sol", "pragma solidity ^0.8.0; contract Sensitive { function value() public pure returns (uint) { return 1; } }").unwrap();
+    let output = compile();
+    output.assert_success();
+    assert_eq!(output.compiled_artifacts().artifact_files().count(), 1);
+    assert!(output.compiled_artifacts().find_first("Sensitive").is_some());
+    assert!(compile().is_unchanged());
+}
+
+#[test]
+fn preprocessor_context_growth_invalidates_out_of_scope_consumers() {
+    let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+    project.set_solc("0.8.30");
+    project.add_source("Unrelated", "pragma solidity ^0.8.0; contract Unrelated {}").unwrap();
+    project.add_test("Sensitive.t.sol", "pragma solidity ^0.8.0; contract Sensitive { function value() public pure returns (uint) { return 1; } }").unwrap();
+    project.add_source("Consumer", "pragma solidity ^0.8.0; import '../test/Sensitive.t.sol'; contract Consumer is Sensitive {}").unwrap();
+    let compile = || {
+        ProjectCompiler::new(project.project())
+            .unwrap()
+            .with_preprocessor(ContextSensitivePreprocessor)
+            .compile()
+            .unwrap()
+    };
+    let before = compile();
+    before.assert_success();
+    let added = project.add_source("Added", "pragma solidity ^0.8.0; contract Added {}").unwrap();
+    let output =
+        ProjectCompiler::with_sources(project.project(), Source::read_all([added]).unwrap())
+            .unwrap()
+            .with_preprocessor(ContextSensitivePreprocessor)
+            .compile()
+            .unwrap();
+    output.assert_success();
+    assert_eq!(output.compiled_artifacts().artifact_files().count(), 1);
+    let cache = CompilerCache::<MultiCompilerSettings>::read(project.cache_path()).unwrap();
+    assert_eq!(
+        cache.files.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([PathBuf::from("src/Added.sol"), PathBuf::from("src/Unrelated.sol")])
+    );
+
+    let after = compile();
+    after.assert_success();
+    assert_eq!(after.compiled_artifacts().artifact_files().count(), 2);
+    assert_ne!(
+        before.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap(),
+        after.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap()
+    );
+    assert!(compile().is_unchanged());
+
+    project.project_mut().cached = false;
+    let clean = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ContextSensitivePreprocessor)
+        .compile()
+        .unwrap();
+    clean.assert_success();
+    assert_eq!(
+        after.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap(),
+        clean.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap()
+    );
+
+    project.project_mut().cached = true;
+    fs::remove_file(project.paths().sources.join("Added.sol")).unwrap();
+    let removed = ProjectCompiler::new(project.project())
+        .unwrap()
+        .with_preprocessor(ContextSensitivePreprocessor)
+        .compile()
+        .unwrap();
+    removed.assert_success();
+    assert_eq!(removed.compiled_artifacts().artifact_files().count(), 2);
+    assert_eq!(
+        before.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap(),
+        removed.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap()
+    );
 }

@@ -25,6 +25,7 @@ use foundry_compilers_artifacts::{
     },
 };
 use foundry_compilers_core::utils;
+use serde::Serialize;
 use std::{fs, path::Path};
 
 /// An `Artifact` implementation that can be configured to include additional content and emit
@@ -170,6 +171,10 @@ impl ConfigurableArtifacts {
 impl ArtifactOutput for ConfigurableArtifacts {
     type Artifact = ConfigurableContractArtifact;
     type CompilerContract = Contract;
+
+    fn read_cached_artifact(path: &Path) -> Result<Self::Artifact, SolcError> {
+        utils::read_json_file_with(path, ConfigurableContractArtifact::from_json)
+    }
 
     /// Writes extra files for compiled artifact based on [Self::additional_files]
     fn handle_artifacts(
@@ -441,7 +446,7 @@ impl ArtifactOutput for ConfigurableArtifacts {
 }
 
 /// Determines the additional values to include in the contract's artifact file
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ExtraOutputValues {
     pub ast: bool,
     pub userdoc: bool,

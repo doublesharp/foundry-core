@@ -5,6 +5,9 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(windows)]
+use path_slash::PathExt;
+
 #[cfg(feature = "walkdir")]
 mod find;
 
@@ -141,8 +144,7 @@ impl<'de> Deserialize<'de> for Remapping {
     where
         D: serde::de::Deserializer<'de>,
     {
-        let remapping = String::deserialize(deserializer)?;
-        Self::from_str(&remapping).map_err(serde::de::Error::custom)
+        crate::serde_helpers::display_from_str::deserialize(deserializer)
     }
 }
 
@@ -153,9 +155,9 @@ impl fmt::Display for Remapping {
         if let Some(context) = self.context.as_ref() {
             #[cfg(target_os = "windows")]
             {
-                // ensure we have `/` slashes on windows
-                use path_slash::PathExt;
-                s.push_str(&std::path::Path::new(context).to_slash_lossy());
+                // ensure we have `/` slashes on windows, keeping the trailing separator that
+                // marks the context as a directory prefix
+                s.push_str(&slash_prefix(context));
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -172,7 +174,6 @@ impl fmt::Display for Remapping {
             #[cfg(target_os = "windows")]
             {
                 // ensure we have `/` slashes on windows
-                use path_slash::PathExt;
                 format!("{}={}", name, std::path::Path::new(&self.path).to_slash_lossy())
             }
             #[cfg(not(target_os = "windows"))]
@@ -189,18 +190,33 @@ impl fmt::Display for Remapping {
 }
 
 impl Remapping {
-    /// Converts any `\\` separators in the `path` to `/`.
+    /// Converts Windows separators in the target and context to `/`, preserving trailing
+    /// separators.
     #[allow(clippy::missing_const_for_fn)]
     pub fn slash_path(&mut self) {
         #[cfg(windows)]
         {
-            use path_slash::PathExt;
-            self.path = Path::new(&self.path).to_slash_lossy().to_string();
+            self.path = slash_prefix(&self.path);
             if let Some(context) = self.context.as_mut() {
-                *context = Path::new(&context).to_slash_lossy().to_string();
+                *context = slash_prefix(context);
             }
         }
     }
+}
+
+/// Converts Windows separators in a remapping target or context to `/`.
+///
+/// Remapping targets and contexts are lexical prefixes, so a trailing separator must survive the
+/// conversion (including repeated conversion). `to_slash_lossy` only keeps a trailing `\`, so a
+/// prefix that already ends in `/` would otherwise lose it.
+#[cfg(windows)]
+fn slash_prefix(path: &str) -> String {
+    let has_boundary = path.ends_with(['/', '\\']);
+    let mut path = Path::new(path).to_slash_lossy().into_owned();
+    if has_boundary && !path.ends_with('/') {
+        path.push('/');
+    }
+    path
 }
 
 /// A relative [`Remapping`] that's aware of the current location
@@ -256,9 +272,9 @@ impl fmt::Display for RelativeRemapping {
         if let Some(context) = self.context.as_ref() {
             #[cfg(target_os = "windows")]
             {
-                // ensure we have `/` slashes on windows
-                use path_slash::PathExt;
-                s.push_str(&std::path::Path::new(context).to_slash_lossy());
+                // ensure we have `/` slashes on windows, keeping the trailing separator that
+                // marks the context as a directory prefix
+                s.push_str(&slash_prefix(context));
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -270,7 +286,6 @@ impl fmt::Display for RelativeRemapping {
             #[cfg(target_os = "windows")]
             {
                 // ensure we have `/` slashes on windows
-                use path_slash::PathExt;
                 format!("{}={}", self.name, self.path.original().to_slash_lossy())
             }
             #[cfg(not(target_os = "windows"))]
@@ -373,8 +388,7 @@ impl<'de> Deserialize<'de> for RelativeRemapping {
     where
         D: serde::de::Deserializer<'de>,
     {
-        let remapping = String::deserialize(deserializer)?;
-        let remapping = Remapping::from_str(&remapping).map_err(serde::de::Error::custom)?;
+        let remapping = Remapping::deserialize(deserializer)?;
         Ok(Self { context: remapping.context, name: remapping.name, path: remapping.path.into() })
     }
 }
@@ -391,6 +405,54 @@ fn needs_trailing_slash(name_or_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     pub use super::*;
+
+    #[test]
+    fn deserialize_remapping_strings() {
+        assert_eq!(
+            Remapping::deserialize(
+                serde::de::value::BytesDeserializer::<serde::de::value::Error>::new(b"a/=lib/a/")
+            )
+            .unwrap(),
+            "a/=lib/a/".parse::<Remapping>().unwrap()
+        );
+        assert!(
+            Remapping::deserialize(
+                serde::de::value::BytesDeserializer::<serde::de::value::Error>::new(b"\xff")
+            )
+            .is_err()
+        );
+        for value in [
+            "a/=lib/a/",
+            "context:a/=lib/a/",
+            ":a/=lib/a/",
+            "é/=日本語/",
+            "a/=lib/\\a/",
+            "",
+            "a",
+            "=path",
+            "a=",
+            " :a/=path",
+        ] {
+            let json = serde_json::to_string(value).unwrap();
+            let expected = value.parse::<Remapping>();
+            let parsed = serde_json::from_str::<Remapping>(&json);
+            let owned =
+                serde_json::from_value::<Remapping>(serde_json::Value::String(value.into()));
+            match expected {
+                Ok(expected) => {
+                    assert_eq!(parsed.unwrap(), expected);
+                    assert_eq!(owned.unwrap(), expected);
+                }
+                Err(_) => {
+                    assert!(parsed.is_err());
+                    assert!(owned.is_err());
+                }
+            }
+        }
+        for json in ["null", "123", "[]", "{}", "true"] {
+            assert!(serde_json::from_str::<Remapping>(json).is_err());
+        }
+    }
 
     #[test]
     fn relative_remapping() {
@@ -485,5 +547,74 @@ mod tests {
             }
         );
         assert_eq!(remapping.to_string(), "@my-lib/B.sol=lib/my-lib/B.sol".to_string());
+    }
+
+    #[test]
+    fn display_keeps_trailing_slash_of_context() {
+        for remapping in ["lib/owner/:dep/=lib/dep/", "lib/owner:dep/=lib/dep/"] {
+            let parsed = Remapping::from_str(remapping).unwrap();
+            assert_eq!(parsed.to_string(), remapping);
+            let relative = RelativeRemapping::from(parsed);
+            assert_eq!(relative.to_string(), remapping);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slash_path_preserves_prefix_boundaries() {
+        for (path, expected) in [
+            ("lib/forge-std/src/", "lib/forge-std/src/"),
+            (r"lib\forge-std\src\", "lib/forge-std/src/"),
+            (r"lib\forge-std/src/", "lib/forge-std/src/"),
+            (r"lib\forge-std\src", "lib/forge-std/src"),
+            (r"lib\forge-std\Test.sol", "lib/forge-std/Test.sol"),
+            (r"C:\project\lib/", "C:/project/lib/"),
+            (r"\\server\share\lib/", r"\\server\share/lib/"),
+            (r"\\?\C:\project/", r"\\?\C:/project/"),
+        ] {
+            let mut remapping = Remapping {
+                context: Some(path.into()),
+                name: "forge-std/".into(),
+                path: path.into(),
+            };
+            for _ in 0..2 {
+                remapping.slash_path();
+                assert_eq!(remapping.path, expected);
+                assert_eq!(remapping.context.as_deref(), Some(expected));
+                assert_eq!(remapping.name, "forge-std/");
+            }
+        }
+    }
+
+    #[test]
+    fn serialization_preserves_context_boundaries() {
+        for (context, expected) in [
+            ("lib/owner/", "lib/owner/:dep/=lib/dep/"),
+            ("lib/owner", "lib/owner:dep/=lib/dep/"),
+            ("lib/Owner.sol", "lib/Owner.sol:dep/=lib/dep/"),
+            ("/", "/:dep/=lib/dep/"),
+            #[cfg(windows)]
+            (r"lib\owner\", "lib/owner/:dep/=lib/dep/"),
+            #[cfg(windows)]
+            (r"lib\owner/", "lib/owner/:dep/=lib/dep/"),
+        ] {
+            let remapping = Remapping {
+                context: Some(context.into()),
+                name: "dep/".into(),
+                path: "lib/dep/".into(),
+            };
+            let relative = RelativeRemapping::from(remapping.clone());
+            let expected = serde_json::to_string(expected).unwrap();
+            for json in [
+                serde_json::to_string(&remapping).unwrap(),
+                serde_json::to_string(&relative).unwrap(),
+            ] {
+                assert_eq!(json, expected);
+                let reloaded = serde_json::from_str::<Remapping>(&json).unwrap();
+                assert_eq!(serde_json::to_string(&reloaded).unwrap(), expected);
+                let reloaded = serde_json::from_str::<RelativeRemapping>(&json).unwrap();
+                assert_eq!(serde_json::to_string(&reloaded).unwrap(), expected);
+            }
+        }
     }
 }

@@ -25,12 +25,15 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write
       pull-requests: read
     outputs:
       head-ref: ${{ steps.context.outputs.head-ref }}
       head-sha: ${{ steps.context.outputs.head-sha }}
       pr-number: ${{ steps.context.outputs.pr-number }}
     steps:
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@2ab28a31ae569be9f780c7675b684471060afa40
       - name: Record trusted workflow context
         id: context
         env:
@@ -96,13 +99,12 @@ jobs:
           fi
 
       - name: Set up pnpm
-        uses: tempoxyz/gh-actions/vendor/pnpm/action-setup@134b6c9105953bcf6d50ef0f3f70e31b7a3ec64f
+        uses: tempoxyz/gh-actions/vendor/pnpm/action-setup@2ab28a31ae569be9f780c7675b684471060afa40
         with:
           version: 11.9.0
           run_install: false
-
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: crates/wallets/src/wallet_browser/app/src/.nvmrc
           cache: pnpm
@@ -144,7 +146,7 @@ jobs:
           done
 
       - name: Upload bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: browser-wallet-bundle
           path: |
@@ -218,7 +220,7 @@ jobs:
             <<< "$files_json" > /dev/null
 
       - name: Download bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: browser-wallet-bundle
           path: ${{ runner.temp }}/browser-wallet-bundle

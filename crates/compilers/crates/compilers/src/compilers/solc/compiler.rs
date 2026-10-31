@@ -554,7 +554,9 @@ impl Solc {
         }
 
         let raw_output = self.compile_output_bytes(&input)?;
-        let output = serde_json::from_slice(&raw_output)?;
+        // Validate UTF-8 once before deserializing compiler output.
+        let text = simdutf8::basic::from_utf8(&raw_output).map_err(|_| SolcError::InvalidUtf8)?;
+        let output = serde_json::from_str(text)?;
         // The executable may have changed between lookup and process creation.
         if let Some((cache, (key, identity))) =
             self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
@@ -661,10 +663,9 @@ impl Solc {
 
     fn version_impl(solc: &Path, args: &[String]) -> Result<Version> {
         let mut cmd = Command::new(solc);
-        if is_solar_binary(solc) {
-            cmd.env("SOLC_WRAPPER", "1");
-        }
-        cmd.args(args)
+        // Makes Solar report its solc-compatible version under any file name; solc ignores it.
+        cmd.env("SOLC_WRAPPER", "1")
+            .args(args)
             .arg("--version")
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1099,10 +1100,11 @@ impl Solc {
 
     pub async fn async_version(solc: &Path) -> Result<Version> {
         let mut cmd = tokio::process::Command::new(solc);
-        if is_solar_binary(solc) {
-            cmd.env("SOLC_WRAPPER", "1");
-        }
-        cmd.arg("--version").stdin(Stdio::piped()).stderr(Stdio::piped()).stdout(Stdio::piped());
+        cmd.env("SOLC_WRAPPER", "1")
+            .arg("--version")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped());
         debug!(?cmd, "getting version");
         let child = async_retry_spawn(|| cmd.spawn()).await.map_err(|e| SolcError::io(e, solc))?;
         let output = child.wait_with_output().await.map_err(|e| SolcError::io(e, solc))?;
@@ -1179,10 +1181,6 @@ fn record_compiler_identity_read(path: &Path) {
 
 fn compile_output(output: Output) -> Result<Vec<u8>> {
     if output.status.success() { Ok(output.stdout) } else { Err(SolcError::solc_output(&output)) }
-}
-
-fn is_solar_binary(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name.to_string_lossy().contains("solar"))
 }
 
 fn version_from_output(output: Output) -> Result<Version> {

@@ -23,7 +23,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
@@ -101,6 +101,24 @@ impl Compiler for SolcCompiler {
 
     fn available_versions(&self, _language: &Self::Language) -> Vec<CompilerVersion> {
         match self {
+            // Solar implements every 0.8 release up to the one it reports, so sources pinned to
+            // different exact 0.8 versions can all resolve to it. Keeping its build metadata gives
+            // its artifacts a cache identity distinct from solc's.
+            Self::Specific(solc)
+                if solc.version.build.as_str().contains("solar")
+                    && solc.version.major == 0
+                    && solc.version.minor == 8 =>
+            {
+                (0..=solc.version.patch)
+                    .map(|patch| {
+                        CompilerVersion::Installed(Version {
+                            build: solc.version.build.clone(),
+                            ..Version::new(0, 8, patch)
+                        })
+                    })
+                    .collect()
+            }
+
             Self::Specific(solc) => vec![CompilerVersion::Installed(Version::new(
                 solc.version.major,
                 solc.version.minor,
@@ -519,6 +537,32 @@ impl SourceParser for SolParser {
         let nodes = self.parse_sources(&mut sources)?;
         debug_assert_eq!(nodes.len(), 1, "{nodes:#?}");
         Ok(nodes.into_iter().next().unwrap().1)
+    }
+
+    fn read_all(&mut self, paths: &[PathBuf]) -> Vec<Result<Node<Self::ParsedSource>>> {
+        let mut sources = Sources::new();
+        let reads = paths
+            .iter()
+            .map(|path| {
+                Source::read_(path).map(|source| {
+                    sources.insert(path.clone(), source);
+                })
+            })
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return reads.into_iter().map(|read| Err(read.unwrap_err())).collect();
+        }
+        let Ok(nodes) = self.parse_sources(&mut sources) else {
+            return paths.iter().map(|path| self.read(path)).collect();
+        };
+        let nodes = nodes.into_iter().collect::<HashMap<_, _>>();
+        paths
+            .iter()
+            .zip(reads)
+            .map(|(path, read)| {
+                read.map(|()| nodes.get(path).cloned().expect("parsed source missing"))
+            })
+            .collect()
     }
 
     fn parse_sources(

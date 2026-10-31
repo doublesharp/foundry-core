@@ -1,12 +1,14 @@
 //! Smart caching and deduplication of requests when using a forking provider.
 
 use crate::{
-    cache::{BlockchainDb, FlushJsonBlockCacheDB, ForkBlockEnv, MemDb, StorageInfo},
+    cache::{
+        AccountFetchPolicy, BlockchainDb, FlushJsonBlockCacheDB, ForkBlockEnv, MemDb, StorageInfo,
+    },
     error::{DatabaseError, DatabaseResult},
 };
 use alloy_chains::Chain;
 use alloy_consensus::BlockHeader;
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256, map::U256Map};
+use alloy_primitives::{Address, B256, Bytes, U64, U256, keccak256, map::U256Map};
 use alloy_provider::{
     DynProvider, Network, Provider,
     network::{AnyNetwork, BlockResponse, primitives::HeaderResponse},
@@ -42,6 +44,27 @@ use std::{
     },
 };
 use tokio::select;
+
+/// Keep state reads hash-addressed without relying on the bare-hash extension to EIP-1898.
+/// Moonbeam parses bare hashes as block numbers, while Rootstock rejects a boolean
+/// `requireCanonical`. An explicit hash object with the optional flag omitted supports both.
+#[derive(Clone, Copy, Debug)]
+struct StateBlockId(BlockId);
+
+impl Serialize for StateBlockId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if let BlockId::Hash(hash) = self.0
+            && hash.require_canonical.is_none()
+        {
+            use serde::ser::SerializeStruct;
+            let mut object = serializer.serialize_struct("StateBlockId", 1)?;
+            object.serialize_field("blockHash", &hash.block_hash)?;
+            object.end()
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
 
 /// Logged when an error is indicative that the user is trying to fork from a non-archive node.
 pub const NON_ARCHIVE_NODE_WARNING: &str = "\
@@ -149,10 +172,10 @@ enum ProviderRequest<Err, N: Network = AnyNetwork> {
 /// The Request type the Backend listens for
 #[derive(Debug)]
 enum BackendRequest<N: Network = AnyNetwork> {
-    /// Fetch the account info
-    Basic(Address, AccountInfoSender),
-    /// Fetch a storage slot
-    Storage(Address, U256, StorageSender),
+    /// Fetch the account info, as a prefetch if the flag is set
+    Basic(Address, AccountInfoSender, bool),
+    /// Fetch a storage slot, as a prefetch if the flag is set
+    Storage(Address, U256, StorageSender, bool),
     /// Fetch a block hash
     BlockHash(u64, BlockHashSender),
     /// Fetch an entire block with transactions
@@ -183,10 +206,10 @@ pub struct BackendHandler<N: Network = AnyNetwork, B = BlockEnv> {
     db: BlockchainDb<B>,
     /// Requests currently in progress
     pending_requests: Vec<ProviderRequest<eyre::Report, N>>,
-    /// Listeners that wait for a `get_account` related response
-    account_requests: HashMap<Address, Vec<AccountInfoSender>>,
-    /// Listeners that wait for a `get_storage_at` response
-    storage_requests: HashMap<(Address, U256), Vec<StorageSender>>,
+    /// Listeners that wait for a `get_account` related response, and whether all are prefetches.
+    account_requests: HashMap<Address, (Vec<AccountInfoSender>, bool)>,
+    /// Listeners that wait for a `get_storage_at` response, and whether all are prefetches.
+    storage_requests: HashMap<(Address, U256), (Vec<StorageSender>, bool)>,
     /// Listeners that wait for a `get_block` response, keyed by pin generation and block number.
     block_requests: HashMap<(u64, u64), Vec<BlockHashSender>>,
     /// Block hashes whose value depends on the pinned block.
@@ -206,6 +229,13 @@ pub struct BackendHandler<N: Network = AnyNetwork, B = BlockEnv> {
     block_hash_via_evm: Option<bool>,
     /// The mode for fetching account data
     account_fetch_mode: Arc<AtomicU8>,
+    /// Account-loading policy fixed when this backend is created.
+    account_fetch_policy: AccountFetchPolicy,
+    /// Prefetched accounts that no read has requested yet. They stay out of `db`, so the cache
+    /// file only holds values that were read.
+    prefetched_accounts: AddressHashMap<AccountInfo>,
+    /// Prefetched storage slots that no read has requested yet, see `prefetched_accounts`.
+    prefetched_storage: HashMap<(Address, U256), U256>,
 }
 
 impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
@@ -225,9 +255,11 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                 None
             }
         });
+        let account_fetch_policy = db.meta().read().account_fetch_policy;
         Self {
             provider,
             db,
+            account_fetch_policy,
             pending_requests: Default::default(),
             account_requests: Default::default(),
             storage_requests: Default::default(),
@@ -240,6 +272,8 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
             block_generation: 0,
             block_hash_via_evm,
             account_fetch_mode: Arc::new(AtomicU8::new(ACCOUNT_FETCH_UNCHECKED)),
+            prefetched_accounts: Default::default(),
+            prefetched_storage: Default::default(),
         }
     }
 
@@ -251,14 +285,24 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
     ///     progress (e.g. another Sender just requested the same account)
     fn on_request(&mut self, req: BackendRequest<N>) {
         match req {
-            BackendRequest::Basic(addr, sender) => {
+            BackendRequest::Basic(addr, sender, prefetch) => {
                 trace!(target: "backendhandler", "received request basic address={:?}", addr);
-                let acc = self.db.accounts().read().get(&addr).cloned();
+                let mut acc = self.db.accounts().read().get(&addr).cloned();
+                if acc.is_none() {
+                    acc = if prefetch {
+                        self.prefetched_accounts.get(&addr).cloned()
+                    } else {
+                        // A read moves a prefetched account into the cache before the reply.
+                        self.prefetched_accounts.remove(&addr).inspect(|acc| {
+                            self.db.accounts().write().insert(addr, acc.clone());
+                        })
+                    };
+                }
                 if let Some(basic) = acc {
                     self.db.cache().record_cache_hit();
                     let _ = sender.send(Ok(basic));
                 } else {
-                    self.request_account(addr, sender);
+                    self.request_account(addr, sender, prefetch);
                 }
             }
             BackendRequest::BlockHash(number, sender) => {
@@ -284,19 +328,31 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
             BackendRequest::Transaction(tx, sender) => {
                 self.request_transaction(tx, sender);
             }
-            BackendRequest::Storage(addr, idx, sender) => {
+            BackendRequest::Storage(addr, idx, sender, prefetch) => {
                 // account is already stored in the cache
-                let value =
+                let mut value =
                     self.db.storage().read().get(&addr).and_then(|acc| acc.get(&idx).copied());
+                if value.is_none() {
+                    value = if prefetch {
+                        self.prefetched_storage.get(&(addr, idx)).copied()
+                    } else {
+                        // A read moves a prefetched slot into the cache before the reply.
+                        self.prefetched_storage.remove(&(addr, idx)).inspect(|value| {
+                            self.db.storage().write().entry(addr).or_default().insert(idx, *value);
+                        })
+                    };
+                }
                 if let Some(value) = value {
                     self.db.cache().record_cache_hit();
                     let _ = sender.send(Ok(value));
                 } else {
                     // account present but not storage -> fetch storage
-                    self.request_account_storage(addr, idx, sender);
+                    self.request_account_storage(addr, idx, sender, prefetch);
                 }
             }
             BackendRequest::SetPinnedBlock(block_id) => {
+                self.prefetched_accounts.clear();
+                self.prefetched_storage.clear();
                 self.block_id = Some(block_id);
                 self.block_anchor = None;
                 self.block_generation = self.block_generation.wrapping_add(1);
@@ -323,21 +379,33 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
     }
 
     /// process a request for account's storage
-    fn request_account_storage(&mut self, address: Address, idx: U256, listener: StorageSender) {
+    ///
+    /// The value goes to the prefetch cache only if every listener is a prefetch.
+    fn request_account_storage(
+        &mut self,
+        address: Address,
+        idx: U256,
+        listener: StorageSender,
+        prefetch: bool,
+    ) {
         match self.storage_requests.entry((address, idx)) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().push(listener);
+                let (listeners, prefetch_only) = entry.get_mut();
+                listeners.push(listener);
+                *prefetch_only &= prefetch;
             }
             Entry::Vacant(entry) => {
                 trace!(target: "backendhandler", %address, %idx, "preparing storage request");
                 self.db.cache().record_cache_miss();
-                entry.insert(vec![listener]);
+                entry.insert((vec![listener], prefetch));
                 let provider = self.provider.clone();
                 let block_id = self.block_id.unwrap_or_default();
                 let fut = Box::pin(async move {
                     let storage = provider
-                        .get_storage_at(address, idx)
-                        .block_id(block_id)
+                        .raw_request(
+                            "eth_getStorageAt".into(),
+                            (address, idx, StateBlockId(block_id)),
+                        )
                         .await
                         .map_err(Into::into);
                     (storage, address, idx)
@@ -354,22 +422,23 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
         let provider = self.provider.clone();
         let block_id = self.block_id.unwrap_or_default();
         let mode = Arc::clone(&self.account_fetch_mode);
+        let policy = self.account_fetch_policy;
         let fut = async move {
+            if policy == AccountFetchPolicy::RequireAccountInfo {
+                return Self::fetch_account_info(&provider, address, block_id)
+                    .await
+                    .map(|info| (info.balance, info.nonce, info.code))
+                    .wrap_err("fork account policy requires eth_getAccountInfo");
+            }
             // depending on the tracked mode we can dispatch requests.
             let initial_mode = mode.load(Ordering::Relaxed);
             match initial_mode {
                 ACCOUNT_FETCH_UNCHECKED => {
                     // single request for accountinfo object
-                    let acc_info_fut =
-                        provider.get_account_info(address).block_id(block_id).into_future();
+                    let acc_info_fut = Self::fetch_account_info(&provider, address, block_id);
 
                     // tri request for account info
-                    let balance_fut =
-                        provider.get_balance(address).block_id(block_id).into_future();
-                    let nonce_fut =
-                        provider.get_transaction_count(address).block_id(block_id).into_future();
-                    let code_fut = provider.get_code_at(address).block_id(block_id).into_future();
-                    let triple_fut = futures::future::try_join3(balance_fut, nonce_fut, code_fut);
+                    let triple_fut = Self::fetch_account_separately(&provider, address, block_id);
                     pin_mut!(acc_info_fut, triple_fut);
 
                     select! {
@@ -393,17 +462,14 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                                     mode.store(ACCOUNT_FETCH_SEPARATE_REQUESTS, Ordering::Relaxed);
                                     Ok((balance, nonce, code))
                                 }
-                                Err(err) => Err(err.into())
+                                Err(err) => Err(err)
                             }
                         }
                     }
                 }
 
                 ACCOUNT_FETCH_SUPPORTS_ACC_INFO => {
-                    let mut res = provider
-                        .get_account_info(address)
-                        .block_id(block_id)
-                        .into_future()
+                    let mut res = Self::fetch_account_info(&provider, address, block_id)
                         .await
                         .map(|info| (info.balance, info.nonce, info.code));
 
@@ -412,28 +478,14 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                     if res.is_err() {
                         mode.store(ACCOUNT_FETCH_SEPARATE_REQUESTS, Ordering::Relaxed);
 
-                        let balance_fut =
-                            provider.get_balance(address).block_id(block_id).into_future();
-                        let nonce_fut = provider
-                            .get_transaction_count(address)
-                            .block_id(block_id)
-                            .into_future();
-                        let code_fut =
-                            provider.get_code_at(address).block_id(block_id).into_future();
-                        res = futures::future::try_join3(balance_fut, nonce_fut, code_fut).await;
+                        res = Self::fetch_account_separately(&provider, address, block_id).await;
                     }
 
                     Ok(res?)
                 }
 
                 ACCOUNT_FETCH_SEPARATE_REQUESTS => {
-                    let balance_fut =
-                        provider.get_balance(address).block_id(block_id).into_future();
-                    let nonce_fut =
-                        provider.get_transaction_count(address).block_id(block_id).into_future();
-                    let code_fut = provider.get_code_at(address).block_id(block_id).into_future();
-
-                    Ok(futures::future::try_join3(balance_fut, nonce_fut, code_fut).await?)
+                    Self::fetch_account_separately(&provider, address, block_id).await
                 }
 
                 _ => unreachable!("Invalid account fetch mode"),
@@ -446,15 +498,44 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
         }))
     }
 
+    async fn fetch_account_info(
+        provider: &DynProvider<N>,
+        address: Address,
+        block_id: BlockId,
+    ) -> eyre::Result<alloy_rpc_types::AccountInfo> {
+        Ok(provider
+            .raw_request("eth_getAccountInfo".into(), (address, StateBlockId(block_id)))
+            .await?)
+    }
+
+    async fn fetch_account_separately(
+        provider: &DynProvider<N>,
+        address: Address,
+        block_id: BlockId,
+    ) -> eyre::Result<(U256, u64, Bytes)> {
+        let params = (address, StateBlockId(block_id));
+        let (balance, nonce, code): (U256, U64, Bytes) = futures::future::try_join3(
+            provider.raw_request("eth_getBalance".into(), params),
+            provider.raw_request("eth_getTransactionCount".into(), params),
+            provider.raw_request("eth_getCode".into(), params),
+        )
+        .await?;
+        Ok((balance, nonce.to(), code))
+    }
+
     /// process a request for an account
-    fn request_account(&mut self, address: Address, listener: AccountInfoSender) {
+    ///
+    /// The value goes to the prefetch cache only if every listener is a prefetch.
+    fn request_account(&mut self, address: Address, listener: AccountInfoSender, prefetch: bool) {
         match self.account_requests.entry(address) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().push(listener);
+                let (listeners, prefetch_only) = entry.get_mut();
+                listeners.push(listener);
+                *prefetch_only &= prefetch;
             }
             Entry::Vacant(entry) => {
                 self.db.cache().record_cache_miss();
-                entry.insert(vec![listener]);
+                entry.insert((vec![listener], prefetch));
                 self.pending_requests.push(self.get_account_req(address));
             }
         }
@@ -517,7 +598,7 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
         let code = Bytes::from(code);
         let params = serde_json::json!([
             { "to": address, "data": code },
-            block_id.unwrap_or_else(BlockId::latest),
+            StateBlockId(block_id.unwrap_or_else(BlockId::latest)),
             { address.to_string(): { "code": code } },
         ]);
         let output: Bytes = provider
@@ -542,7 +623,7 @@ impl<N: Network, B: ForkBlockEnv> BackendHandler<N, B> {
                 "to": Address::with_last_byte(0x64),
                 "data": "0x051038f2", // arbOSVersion()
             },
-            block_id.unwrap_or_else(BlockId::latest),
+            StateBlockId(block_id.unwrap_or_else(BlockId::latest)),
         ]);
         let output = provider
             .raw_request::<_, Bytes>("eth_call".into(), params)
@@ -717,7 +798,8 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                                 Ok(res) => res,
                                 Err(err) => {
                                     let err = Arc::new(err);
-                                    if let Some(listeners) = pin.account_requests.remove(&addr) {
+                                    if let Some((listeners, _)) = pin.account_requests.remove(&addr)
+                                    {
                                         for l in listeners {
                                             let _ = l.send(Err(DatabaseError::GetAccount(
                                                 addr,
@@ -744,13 +826,17 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                                 code_hash,
                                 account_id: None,
                             };
-                            pin.db.accounts().write().insert(addr, acc.clone());
+                            let (listeners, prefetch_only) =
+                                pin.account_requests.remove(&addr).unwrap_or_default();
+                            if prefetch_only {
+                                pin.prefetched_accounts.insert(addr, acc.clone());
+                            } else {
+                                pin.db.accounts().write().insert(addr, acc.clone());
+                            }
 
                             // notify all listeners
-                            if let Some(listeners) = pin.account_requests.remove(&addr) {
-                                for l in listeners {
-                                    let _ = l.send(Ok(acc.clone()));
-                                }
+                            for l in listeners {
+                                let _ = l.send(Ok(acc.clone()));
                             }
                             continue;
                         }
@@ -762,7 +848,7 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                                 Err(err) => {
                                     // notify all listeners
                                     let err = Arc::new(err);
-                                    if let Some(listeners) =
+                                    if let Some((listeners, _)) =
                                         pin.storage_requests.remove(&(addr, idx))
                                     {
                                         for l in listeners {
@@ -778,13 +864,22 @@ impl<N: Network, B: ForkBlockEnv> Future for BackendHandler<N, B> {
                             };
 
                             // update the cache
-                            pin.db.storage().write().entry(addr).or_default().insert(idx, value);
+                            let (listeners, prefetch_only) =
+                                pin.storage_requests.remove(&(addr, idx)).unwrap_or_default();
+                            if prefetch_only {
+                                pin.prefetched_storage.insert((addr, idx), value);
+                            } else {
+                                pin.db
+                                    .storage()
+                                    .write()
+                                    .entry(addr)
+                                    .or_default()
+                                    .insert(idx, value);
+                            }
 
                             // notify all listeners
-                            if let Some(listeners) = pin.storage_requests.remove(&(addr, idx)) {
-                                for l in listeners {
-                                    let _ = l.send(Ok(value));
-                                }
+                            for l in listeners {
+                                let _ = l.send(Ok(value));
                             }
                             continue;
                         }
@@ -1110,19 +1205,42 @@ impl<N: Network, B: ForkBlockEnv> SharedBackend<N, B> {
         })
     }
 
-    fn do_get_basic(&self, address: Address) -> DatabaseResult<Option<AccountInfo>> {
+    /// Fetches an account like [`DatabaseRef::basic_ref`], but keeps it out of the cache file
+    /// until a normal read requests it, so a wrong prediction does not persist.
+    ///
+    /// Errors are returned without logging.
+    pub fn prefetch_basic(&self, address: Address) -> DatabaseResult<()> {
+        self.do_get_basic(address, true).map(drop)
+    }
+
+    /// Fetches a storage slot like [`DatabaseRef::storage_ref`], but keeps it out of the cache
+    /// file until a normal read requests it. See [`Self::prefetch_basic`].
+    pub fn prefetch_storage(&self, address: Address, index: U256) -> DatabaseResult<()> {
+        self.do_get_storage(address, index, true).map(drop)
+    }
+
+    fn do_get_basic(
+        &self,
+        address: Address,
+        prefetch: bool,
+    ) -> DatabaseResult<Option<AccountInfo>> {
         self.blocking_mode.run(|| {
             let (sender, rx) = oneshot_channel();
-            let req = BackendRequest::Basic(address, sender);
+            let req = BackendRequest::Basic(address, sender, prefetch);
             self.backend.unbounded_send(req)?;
             rx.recv()?.map(Some)
         })
     }
 
-    fn do_get_storage(&self, address: Address, index: U256) -> DatabaseResult<U256> {
+    fn do_get_storage(
+        &self,
+        address: Address,
+        index: U256,
+        prefetch: bool,
+    ) -> DatabaseResult<U256> {
         self.blocking_mode.run(|| {
             let (sender, rx) = oneshot_channel();
-            let req = BackendRequest::Storage(address, index, sender);
+            let req = BackendRequest::Storage(address, index, sender, prefetch);
             self.backend.unbounded_send(req)?;
             rx.recv()?
         })
@@ -1251,7 +1369,7 @@ impl<N: Network, B: ForkBlockEnv> DatabaseRef for SharedBackend<N, B> {
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         trace!(target: "sharedbackend", %address, "request basic");
-        self.do_get_basic(address).inspect_err(|err| {
+        self.do_get_basic(address, false).inspect_err(|err| {
             error!(target: "sharedbackend", %err, %address, "Failed to send/recv `basic`");
             if err.is_possibly_non_archive_node_error() {
                 error!(target: "sharedbackend", "{NON_ARCHIVE_NODE_WARNING}");
@@ -1265,7 +1383,7 @@ impl<N: Network, B: ForkBlockEnv> DatabaseRef for SharedBackend<N, B> {
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         trace!(target: "sharedbackend", "request storage {:?} at {:?}", address, index);
-        self.do_get_storage(address, index).inspect_err(|err| {
+        self.do_get_storage(address, index, false).inspect_err(|err| {
             error!(target: "sharedbackend", %err, %address, %index, "Failed to send/recv `storage`");
             if err.is_possibly_non_archive_node_error() {
                 error!(target: "sharedbackend", "{NON_ARCHIVE_NODE_WARNING}");
@@ -1291,7 +1409,7 @@ mod tests {
     use alloy_provider::ProviderBuilder;
     use alloy_rpc_client::ClientBuilder;
     use serde::Deserialize;
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
     use tiny_http::{Response, Server};
 
     pub fn get_http_provider(endpoint: &str) -> impl Provider<AnyNetwork> + Clone + use<> {
@@ -1303,6 +1421,174 @@ mod tests {
     fn exact_meta(endpoint: &str, anchor_hash: B256) -> BlockchainDbMeta<BlockEnv> {
         BlockchainDbMeta::new(BlockEnv::default(), endpoint.to_string())
             .with_fork_identity(anchor_hash, B256::with_last_byte(1))
+    }
+
+    #[test]
+    fn state_block_id_preserves_hash_objects_numbers_and_tags() {
+        let hash = B256::with_last_byte(1);
+        assert_eq!(
+            serde_json::to_value(StateBlockId(hash.into())).unwrap(),
+            serde_json::json!({"blockHash": hash})
+        );
+        for block in [
+            BlockId::number(123),
+            BlockId::latest(),
+            BlockId::pending(),
+            BlockId::safe(),
+            BlockId::finalized(),
+            BlockId::earliest(),
+            BlockId::from((hash, Some(false))),
+            BlockId::from((hash, Some(true))),
+        ] {
+            assert_eq!(
+                serde_json::to_value(StateBlockId(block)).unwrap(),
+                serde_json::to_value(block).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exact_anchor_account_requests_use_hash_objects_without_canonical_flag() {
+        for (policy, mode, reject_account_info) in [
+            (AccountFetchPolicy::RequireAccountInfo, ACCOUNT_FETCH_UNCHECKED, false),
+            (AccountFetchPolicy::Auto, ACCOUNT_FETCH_UNCHECKED, false),
+            (AccountFetchPolicy::Auto, ACCOUNT_FETCH_UNCHECKED, true),
+            (AccountFetchPolicy::Auto, ACCOUNT_FETCH_SUPPORTS_ACC_INFO, false),
+            (AccountFetchPolicy::Auto, ACCOUNT_FETCH_SUPPORTS_ACC_INFO, true),
+            (AccountFetchPolicy::Auto, ACCOUNT_FETCH_SEPARATE_REQUESTS, true),
+        ] {
+            let (endpoint, stop, server) = account_policy_server(reject_account_info);
+            let hash = B256::with_last_byte(1);
+            let provider = get_http_provider(&endpoint);
+            let db = BlockchainDb::new(
+                exact_meta(&endpoint, hash).with_account_fetch_policy(policy),
+                None,
+            );
+            let (backend, handler) =
+                SharedBackend::new_with_anchor(provider, db, ForkBlock::new(123, hash)).unwrap();
+            handler.account_fetch_mode.store(mode, Ordering::Relaxed);
+            tokio::spawn(handler);
+            for address in [Address::with_last_byte(1), Address::with_last_byte(2)] {
+                let account = backend.basic_ref(address).unwrap().unwrap();
+                assert_eq!(account.nonce, 7);
+                assert_eq!(account.code.unwrap().original_bytes(), Bytes::from_static(&[0x60, 0]));
+                if reject_account_info {
+                    assert_eq!(account.balance, U256::from(65535));
+                } else if policy == AccountFetchPolicy::RequireAccountInfo {
+                    assert_eq!(account.balance, U256::from(42));
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let requests = server.join().unwrap();
+            assert!(!requests.is_empty());
+            for request in requests {
+                // Exact equality rejects both Moonbeam's ambiguous bare-hash form and
+                // Rootstock's unsupported boolean (or null) requireCanonical field.
+                assert_eq!(request["params"][1], serde_json::json!({"blockHash": hash}));
+            }
+        }
+    }
+
+    /// Serves deliberately inconsistent balances from the two account RPC paths.
+    fn account_policy_server(
+        reject_account_info: bool,
+    ) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            while !stopped.load(Ordering::Relaxed) {
+                if let Some(mut request) = server.recv_timeout(Duration::from_millis(20)).unwrap() {
+                    let rpc: serde_json::Value =
+                        serde_json::from_reader(request.as_reader()).unwrap();
+                    let mut response = serde_json::json!({"jsonrpc": "2.0", "id": rpc["id"]});
+                    if rpc["method"] == "eth_getAccountInfo" && reject_account_info {
+                        response["error"] =
+                            serde_json::json!({"code": -32601, "message": "unsupported"});
+                    } else {
+                        response["result"] = match rpc["method"].as_str().unwrap() {
+                            "eth_getAccountInfo" => serde_json::json!({
+                                "balance": "0x2a", "nonce": "0x7", "code": "0x6000",
+                            }),
+                            "eth_getBalance" => serde_json::json!("0xffff"),
+                            "eth_getTransactionCount" => serde_json::json!("0x7"),
+                            "eth_getCode" => serde_json::json!("0x6000"),
+                            method => panic!("unexpected method {method}"),
+                        };
+                    }
+                    requests.push(rpc);
+                    request.respond(Response::from_string(response.to_string())).unwrap();
+                }
+            }
+            requests
+        });
+        (endpoint, stop, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn required_account_info_uses_authoritative_balance_and_pinned_block() {
+        let (endpoint, stop, server) = account_policy_server(false);
+        let provider = get_http_provider(&endpoint);
+        let meta = BlockchainDbMeta::new(BlockEnv::default(), endpoint)
+            .with_account_fetch_policy(AccountFetchPolicy::RequireAccountInfo);
+        let db = BlockchainDb::new(meta, None);
+        let hash = B256::with_last_byte(1);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db, Some(hash.into())).await;
+        let address = Address::with_last_byte(1);
+        let account = backend.basic_ref(address).unwrap().unwrap();
+        assert_eq!(account.balance, U256::from(42));
+        assert_eq!(account.nonce, 7);
+        assert_eq!(account.code.unwrap().original_bytes(), Bytes::from_static(&[0x60, 0]));
+
+        backend.set_pinned_block(123).unwrap();
+        let clone = backend.clone();
+        assert_eq!(
+            clone.basic_ref(Address::with_last_byte(2)).unwrap().unwrap().balance,
+            U256::from(42)
+        );
+        assert_eq!(backend.basic_ref(address).unwrap().unwrap().balance, U256::from(42));
+        stop.store(true, Ordering::Relaxed);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r["method"] == "eth_getAccountInfo"));
+        assert_eq!(requests[0]["params"], serde_json::json!([address, {"blockHash": hash}]));
+        assert_eq!(requests[1]["params"][1], "0x7b");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn required_account_info_never_falls_back_after_rpc_errors() {
+        let (endpoint, stop, server) = account_policy_server(true);
+        let provider = get_http_provider(&endpoint);
+        let meta = BlockchainDbMeta::new(BlockEnv::default(), endpoint)
+            .with_account_fetch_policy(AccountFetchPolicy::RequireAccountInfo);
+        let db = BlockchainDb::new(meta, None);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db.clone(), None).await;
+        for address in [Address::with_last_byte(1), Address::with_last_byte(2)] {
+            assert!(backend.basic_ref(address).is_err());
+        }
+        assert!(db.accounts().read().is_empty());
+        stop.store(true, Ordering::Relaxed);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r["method"] == "eth_getAccountInfo"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_account_fetch_still_supports_separate_requests() {
+        let (endpoint, stop, server) = account_policy_server(true);
+        let provider = get_http_provider(&endpoint);
+        let meta = BlockchainDbMeta::new(BlockEnv::default(), endpoint);
+        let db = BlockchainDb::new(meta, None);
+        let backend = SharedBackend::spawn_backend(Arc::new(provider), db, None).await;
+        assert_eq!(
+            backend.basic_ref(Address::with_last_byte(1)).unwrap().unwrap().balance,
+            U256::from(65535)
+        );
+        stop.store(true, Ordering::Relaxed);
+        let requests = server.join().unwrap();
+        assert!(requests.iter().any(|r| r["method"] == "eth_getBalance"));
     }
 
     const ENDPOINT: Option<&str> = option_env!("ETH_RPC_URL");
@@ -1464,6 +1750,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn cache_file_keeps_only_read_prefetches() {
+        let joined = Address::with_last_byte(1);
+        let unread = Address::with_last_byte(2);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", server.server_addr());
+        let (held_tx, held_rx) = oneshot_channel();
+        let (release_tx, release_rx) = oneshot_channel::<()>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            while !stopped.load(Ordering::Relaxed) {
+                if let Some(mut request) = server.recv_timeout(Duration::from_millis(20)).unwrap() {
+                    let rpc: serde_json::Value =
+                        serde_json::from_reader(request.as_reader()).unwrap();
+                    let account = rpc["method"] == "eth_getAccountInfo";
+                    // Hold only the requests used to test a read joining an in-flight prefetch.
+                    if rpc["params"][0] == serde_json::json!(joined)
+                        && (account || rpc["params"][1] == "0x2")
+                    {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                    let result = if account {
+                        serde_json::json!({"balance": "0x2a", "nonce": "0x0", "code": "0x"})
+                    } else {
+                        assert_eq!(rpc["method"], "eth_getStorageAt");
+                        serde_json::json!("0x2a")
+                    };
+                    let response =
+                        serde_json::json!({"jsonrpc": "2.0", "id": rpc["id"], "result": result});
+                    requests.push(rpc);
+                    request.respond(Response::from_string(response.to_string())).unwrap();
+                }
+            }
+            requests
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let meta = BlockchainDbMeta::new(BlockEnv::default(), endpoint.clone())
+            .with_account_fetch_policy(AccountFetchPolicy::RequireAccountInfo);
+        let db = BlockchainDb::new(meta, Some(path.clone()));
+        let provider = Arc::new(get_http_provider(&endpoint));
+        let mut backend = SharedBackend::spawn_backend(provider, db, None)
+            .await
+            .with_blocking_mode(BlockingMode::Block);
+
+        // Unread prefetches stay out of the file.
+        backend.prefetch_basic(unread).unwrap();
+        backend.prefetch_storage(unread, U256::from(1)).unwrap();
+        // A read promotes a completed prefetch without another RPC request.
+        backend.prefetch_storage(joined, U256::from(1)).unwrap();
+        assert_eq!(backend.storage_ref(joined, U256::from(1)).unwrap(), U256::from(42));
+
+        let prefetch = std::thread::spawn({
+            let backend = backend.clone();
+            move || backend.prefetch_basic(joined).unwrap()
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (sender, read) = oneshot_channel();
+        backend.backend.unbounded_send(BackendRequest::Basic(joined, sender, false)).unwrap();
+        // This barrier completes only after the handler registers the preceding read.
+        backend.do_any_request(async { Ok(()) }).unwrap();
+        release_tx.send(()).unwrap();
+        prefetch.join().unwrap();
+        assert_eq!(read.recv().unwrap().unwrap().balance, U256::from(42));
+
+        let prefetch = std::thread::spawn({
+            let backend = backend.clone();
+            move || backend.prefetch_storage(joined, U256::from(2)).unwrap()
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (sender, read) = oneshot_channel();
+        backend
+            .backend
+            .unbounded_send(BackendRequest::Storage(joined, U256::from(2), sender, false))
+            .unwrap();
+        backend.do_any_request(async { Ok(()) }).unwrap();
+        release_tx.send(()).unwrap();
+        prefetch.join().unwrap();
+        assert_eq!(read.recv().unwrap().unwrap(), U256::from(42));
+        stop.store(true, Ordering::Relaxed);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        backend.flush_cache();
+
+        let cache = JsonBlockCacheDB::<BlockEnv>::load(&path).unwrap();
+        assert_eq!(cache.db().accounts.read().keys().collect::<Vec<_>>(), [&joined]);
+        let storage = cache.db().storage.read();
+        assert_eq!(storage.keys().collect::<Vec<_>>(), [&joined]);
+        assert_eq!(storage[&joined].len(), 2);
+        assert_eq!(storage[&joined][&U256::from(1)], U256::from(42));
+        assert_eq!(storage[&joined][&U256::from(2)], U256::from(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn exact_anchor_pins_storage_and_block_ancestry() {
         let server = Server::http("127.0.0.1:0").expect("failed starting in-memory http server");
         let endpoint = format!("http://{}", server.server_addr());
@@ -1481,7 +1864,7 @@ mod tests {
             let mut storage_request = server.recv().unwrap();
             let storage: Request = serde_json::from_reader(storage_request.as_reader()).unwrap();
             assert_eq!(storage.method, "eth_getStorageAt");
-            assert_eq!(storage.params[2], anchor_hash.to_string());
+            assert_eq!(storage.params[2], serde_json::json!({"blockHash": anchor_hash}));
             storage_request
                 .respond(Response::from_string(
                     serde_json::json!({
@@ -1893,7 +2276,7 @@ mod tests {
             let mut request = server.recv().unwrap();
             let rpc_request: Request = serde_json::from_reader(request.as_reader()).unwrap();
             assert_eq!(rpc_request.method, "eth_call");
-            assert_eq!(rpc_request.params[1], anchor_hash.to_string());
+            assert_eq!(rpc_request.params[1], serde_json::json!({"blockHash": anchor_hash}));
             assert_eq!(
                 rpc_request.params[0]["data"],
                 format!("0x7f{:064x}4060005260206000f3", U256::from(99))
@@ -2064,7 +2447,7 @@ mod tests {
             for _ in 1..max_slots {
                 for (address, info) in &storage_data {
                     for (index, value) in info {
-                        let result_storage = backend.do_get_storage(*address, *index);
+                        let result_storage = backend.do_get_storage(*address, *index, false);
                         match result_storage {
                             Ok(stg_db) => {
                                 assert_eq!(
@@ -2196,7 +2579,7 @@ mod tests {
             for _ in 1..max_slots {
                 for (address, info) in &storage_data {
                     for (index, value) in info {
-                        let result_storage = backend.do_get_storage(*address, *index);
+                        let result_storage = backend.do_get_storage(*address, *index, false);
                         match result_storage {
                             Ok(stg_db) => {
                                 assert_eq!(

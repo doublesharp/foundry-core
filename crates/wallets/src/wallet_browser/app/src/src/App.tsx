@@ -5,14 +5,16 @@ import { KeyAuthorization } from "ox/tempo";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Address, type Chain, createWalletClient, custom, type Hex } from "viem";
 import { waitForTransactionReceipt } from "viem/actions";
-
+import { isUserRejection } from "./utils/errors.ts";
 import {
   api,
   applyChainId,
+  formatNetwork,
   isOk,
   parseChainId,
   renderJSON,
   renderMaybeParsedJSON,
+  transactionTargetChainId,
 } from "./utils/helpers.ts";
 import { prepareTransactionRequest } from "./utils/transaction.ts";
 import type {
@@ -36,6 +38,7 @@ import type {
 const POLL_REQUEST_INTERVAL_MS = 1000;
 const POLL_SESSION_INTERVAL_MS = 3000;
 const CHAIN_SWITCH_EVENT_GRACE_MS = 5000;
+const USER_REJECTION_SIGNAL = "__foundry_user_rejected__";
 
 export function App() {
   useEffect(() => {
@@ -57,6 +60,11 @@ export function App() {
 
   const [pendingTx, setPendingTx] = useState<PendingAny | null>(null);
   const [pendingChainSwitch, setPendingChainSwitch] = useState<PendingChainSwitch | null>(null);
+  const [switchStatus, setSwitchStatus] = useState<{
+    targetChainId: number;
+    state: "switching" | "switched" | "failed";
+    error?: string;
+  } | null>(null);
   const [pendingSigning, setPendingSigning] = useState<PendingSigning | null>(null);
   const [pendingKeyAuthorization, setPendingKeyAuthorization] =
     useState<PendingKeyAuthorization | null>(null);
@@ -145,6 +153,7 @@ export function App() {
 
     setPendingTx(null);
     setPendingChainSwitch(null);
+    setSwitchStatus(null);
     setPendingSigning(null);
     setPendingKeyAuthorization(null);
     setAccount(undefined);
@@ -160,6 +169,7 @@ export function App() {
     setIsSending(true);
 
     const { id, chainId: targetChainId } = pendingChainSwitch;
+    setSwitchStatus({ targetChainId, state: "switching" });
     expectedChainSwitchRef.current = targetChainId;
 
     let switchedChainId: number | undefined;
@@ -187,8 +197,10 @@ export function App() {
           chainId: switchedChainId,
           until: Date.now() + CHAIN_SWITCH_EVENT_GRACE_MS,
         };
+        setSwitchStatus({ targetChainId, state: "switched" });
       } catch (e: unknown) {
         const msg = errMessage(e);
+        setSwitchStatus({ targetChainId, state: "failed", error: msg });
         try {
           await api("/api/chain/response", "POST", { id, chainId: null, error: msg });
         } catch {}
@@ -218,6 +230,7 @@ export function App() {
   // the next request without waiting for the receipt.
   const signAndSendCurrentTx = async () => {
     if (!selected || !pendingTx?.request || !sessionAlive || isSending) return;
+    if (transactionTargetChainId(pendingTx.request, chainId) !== chainId) return;
     setIsSending(true);
 
     const id = pendingTx.id;
@@ -250,12 +263,17 @@ export function App() {
       });
     } catch (e: unknown) {
       const msg = errMessage(e);
+      const userRejected = isUserRejection(e);
       console.error("send failed:", msg);
 
       if (!hash) {
-        // Wallet rejected or failed before broadcasting — safe to report error.
+        // Preserve explicit user rejection; other failures remain ambiguous.
         try {
-          await api("/api/transaction/response", "POST", { id, hash: null, error: msg });
+          await api("/api/transaction/response", "POST", {
+            id,
+            hash: null,
+            error: userRejected ? USER_REJECTION_SIGNAL : msg,
+          });
         } catch {}
         updateHistory(id, "tx", { status: "failed", error: msg });
       } else {
@@ -443,7 +461,11 @@ export function App() {
       const id = pendingTx.id;
       const reason = "Rejected by user";
       try {
-        await api("/api/transaction/response", "POST", { id, hash: null, error: reason });
+        await api("/api/transaction/response", "POST", {
+          id,
+          hash: null,
+          error: USER_REJECTION_SIGNAL,
+        });
       } catch {}
       upsertHistory({
         kind: "tx",
@@ -623,7 +645,10 @@ export function App() {
       try {
         const tx = await api<ApiOk<PendingAny> | ApiErr>("/api/transaction/request");
         if (isOk(tx)) {
-          if (active) setPendingTx(tx.data);
+          if (active) {
+            setSwitchStatus(null);
+            setPendingTx(tx.data);
+          }
           return;
         }
       } catch {}
@@ -686,6 +711,11 @@ export function App() {
   }, []);
 
   // --- render ---------------------------------------------------------------
+
+  const targetChainId = pendingTx
+    ? transactionTargetChainId(pendingTx.request, chainId)
+    : undefined;
+  const networkMismatch = pendingTx != null && targetChainId !== chainId;
 
   return (
     <div className="wrapper">
@@ -761,18 +791,48 @@ rpc:     ${chain?.rpcUrls?.default?.http?.[0] ?? chain?.rpcUrls?.public?.http?.[
                 Disconnect
               </button>
             </div>
+            {switchStatus && !pendingTx && (
+              <div
+                className={`network-status ${switchStatus.state}`}
+                role="status"
+                aria-live="polite"
+              >
+                <strong>Requested network: {formatNetwork(switchStatus.targetChainId)}</strong>
+                <div>Connected wallet: {formatNetwork(chainId)}</div>
+                {switchStatus.state === "switching" && <div>Foundry is requesting a switch…</div>}
+                {switchStatus.state === "switched" && <div>Wallet switch confirmed.</div>}
+                {switchStatus.state === "failed" && (
+                  <div>
+                    Switch failed: {switchStatus.error}. Select{" "}
+                    {formatNetwork(switchStatus.targetChainId)}
+                    in your wallet, then reconnect and retry the command.
+                  </div>
+                )}
+              </div>
+            )}
           </>
         )}
 
         {selected && account && confirmed && sessionAlive && pendingTx && (
           <>
             <div className="section-title">Transaction to Sign &amp; Send</div>
+            <div className={`network-status${networkMismatch ? " failed" : ""}`}>
+              <strong>Requested network: {formatNetwork(targetChainId)}</strong>
+              <div>Connected wallet: {formatNetwork(chainId)}</div>
+              {networkMismatch && (
+                <div>
+                  {targetChainId == null
+                    ? "The requested chain ID is invalid. Reject this request and retry the command."
+                    : `Networks differ. Select ${formatNetwork(targetChainId)} in your wallet, then reconnect and retry the command.`}
+                </div>
+              )}
+            </div>
             <div className="action-row">
               <button
                 type="button"
                 className="btn btn-primary"
                 onClick={signAndSendCurrentTx}
-                disabled={isSending || !sessionAlive}
+                disabled={isSending || !sessionAlive || networkMismatch}
               >
                 Sign &amp; Send
               </button>
