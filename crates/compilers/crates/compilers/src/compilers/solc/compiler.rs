@@ -20,7 +20,7 @@ use std::{
     process::{Command, Output, Stdio},
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 #[cfg(feature = "async")]
@@ -31,6 +31,8 @@ use std::os::unix::fs::MetadataExt;
 
 /// Extensions acceptable by solc compiler.
 pub const SOLC_EXTENSIONS: &[&str] = &["sol", "yul"];
+
+const CACHE_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "spawn_tests.rs"]
@@ -537,20 +539,25 @@ impl Solc {
             .as_ref()
             .and_then(|_| self.compiler_output_cache_key(&input));
         if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
-            && let Some(output) = cache.read(key)
+            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
         {
-            match serde_json::from_slice(&output) {
-                Ok(output) => return Ok(output),
-                Err(_) => {
-                    trace!(
-                        target: "foundry_compilers::compiler_cache",
-                        outcome = "corrupt",
-                        key = %key,
-                        reason = "invalid_json",
-                    );
-                    cache.invalidate(key);
+            return Ok(output);
+        }
+
+        let _guard = self.compiler_output_cache.as_ref().zip(cache_key.as_ref()).and_then(
+            |(cache, (key, _))| loop {
+                match cache.try_acquire(key) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(CACHE_LOCK_RETRY_DELAY);
+                    }
+                    result => break result.ok().flatten(),
                 }
-            }
+            },
+        );
+        if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
+        {
+            return Ok(output);
         }
 
         let raw_output = self.compile_output_bytes(&input)?;
@@ -1053,20 +1060,30 @@ impl Solc {
             .as_ref()
             .and_then(|_| self.compiler_output_cache_key(&input));
         if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
-            && let Some(output) = cache.read(key)
+            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
         {
-            match serde_json::from_slice(&output) {
-                Ok(output) => return Ok(output),
-                Err(_) => {
-                    trace!(
-                        target: "foundry_compilers::compiler_cache",
-                        outcome = "corrupt",
-                        key = %key,
-                        reason = "invalid_json",
-                    );
-                    cache.invalidate(key);
+            return Ok(output);
+        }
+
+        // Poll without a blocking task so cancellation also releases runtime shutdown.
+        let _guard = if let Some((cache, (key, _))) =
+            self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+        {
+            loop {
+                match cache.try_acquire(key) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        futures_timer::Delay::new(CACHE_LOCK_RETRY_DELAY).await;
+                    }
+                    result => break result.ok().flatten(),
                 }
             }
+        } else {
+            None
+        };
+        if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
+            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
+        {
+            return Ok(output);
         }
 
         let output = self.async_compile_output_bytes(&input).await?;
@@ -1089,6 +1106,7 @@ impl Solc {
         use tokio::{io::AsyncWriteExt, process::Command};
 
         let mut cmd: Command = self.configure_cmd().into();
+        cmd.kill_on_drop(true);
         let mut child = async_retry_spawn(|| cmd.spawn()).await.map_err(self.map_io_err())?;
         let stdin = child.stdin.as_mut().unwrap();
 
@@ -1179,6 +1197,26 @@ fn record_compiler_identity_read(path: &Path) {
     *COMPILER_IDENTITY_READS.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
 }
 
+fn cached_compiler_output<D: DeserializeOwned>(
+    cache: &dyn CompilerOutputCache,
+    key: &CompilerOutputCacheKey,
+) -> Option<D> {
+    let output = cache.read(key)?;
+    match serde_json::from_slice(&output) {
+        Ok(output) => Some(output),
+        Err(_) => {
+            trace!(
+                target: "foundry_compilers::compiler_cache",
+                outcome = "corrupt",
+                key = %key,
+                reason = "invalid_json",
+            );
+            cache.invalidate(key);
+            None
+        }
+    }
+}
+
 fn compile_output(output: Output) -> Result<Vec<u8>> {
     if output.status.success() { Ok(output.stdout) } else { Err(SolcError::solc_output(&output)) }
 }
@@ -1212,6 +1250,8 @@ mod cache_tests {
         env,
         os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::Instant,
     };
 
     static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2562,6 +2602,241 @@ fi
 
         assert_eq!(first, second);
         assert!(!invocations.exists());
+    }
+
+    fn coalescing_compiler(root: &Path) -> Solc {
+        let mut solc = Solc::new_with_version(root.join("solc"), Version::new(0, 8, 35));
+        solc.set_compiler_output_cache(Arc::new(LocalCompilerOutputCache::new(root.join("cache"))));
+        solc
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !path.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for {}", path.display());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // The parent test starts copies of this test executable in separate working directories.
+    #[test]
+    fn compiler_output_cache_process_worker() {
+        let Some(root) = env::var_os("FOUNDRY_CACHE_PROCESS_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let solc = coalescing_compiler(&root);
+        #[cfg(feature = "async")]
+        if env::var_os("FOUNDRY_CACHE_CANCEL_WAITER").is_some() {
+            let input = serde_json::json!({"language": "Solidity", "sources": {}});
+            let (key, _) =
+                solc.compiler_output_cache_key(&serde_json::to_vec(&input).unwrap()).unwrap();
+            let guard =
+                solc.compiler_output_cache.as_ref().unwrap().try_acquire(&key).unwrap().unwrap();
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let waiter = tokio::spawn(async move {
+                    solc.async_compile_as::<_, serde_json::Value>(&input).await
+                });
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+            });
+            drop(runtime);
+            drop(guard);
+            return;
+        }
+        if env::var_os("FOUNDRY_CACHE_HOLD_LOCK").is_some() {
+            let input =
+                serde_json::to_vec(&serde_json::json!({"language": "Solidity", "sources": {}}))
+                    .unwrap();
+            let (key, _) = solc.compiler_output_cache_key(&input).unwrap();
+            let _guard =
+                solc.compiler_output_cache.as_ref().unwrap().try_acquire(&key).unwrap().unwrap();
+            std::fs::write(root.join(format!("ready-{}", std::process::id())), b"").unwrap();
+            loop {
+                thread::park();
+            }
+        }
+        std::fs::write(root.join(format!("ready-{}", std::process::id())), b"").unwrap();
+        wait_for_file(&root.join("go"));
+        let input = serde_json::json!({"language": "Solidity", "sources": {}});
+        let output: serde_json::Value = if env::var_os("FOUNDRY_CACHE_PROCESS_ASYNC").is_some() {
+            #[cfg(feature = "async")]
+            {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(solc.async_compile_as(&input))
+                    .unwrap()
+            }
+            #[cfg(not(feature = "async"))]
+            panic!("async test needs the async feature");
+        } else {
+            solc.compile_as(&input).unwrap()
+        };
+        assert_eq!(output, serde_json::json!({"contracts": {}}));
+    }
+
+    fn coalescing_fixture() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let executable = root.join("solc");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version: 0.8.35'; exit 0; fi\ncat >/dev/null\necho x >> '{}'\nsleep 1\nprintf '%s\\n' '{{\"contracts\":{{}}}}'\n",
+                root.join("invocations").display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        directory
+    }
+
+    fn check_process_coalescing(asynchronous: bool) {
+        let directory = coalescing_fixture();
+        let root = directory.path();
+        let mut children = Vec::new();
+        for index in 0..4 {
+            let worktree = root.join(format!("worktree-{index}"));
+            std::fs::create_dir(&worktree).unwrap();
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args(["compiler_output_cache_process_worker", "--nocapture"])
+                .current_dir(worktree)
+                .env("FOUNDRY_CACHE_PROCESS_ROOT", root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if asynchronous {
+                command.env("FOUNDRY_CACHE_PROCESS_ASYNC", "1");
+            }
+            children.push(command.spawn().unwrap());
+        }
+        for child in &children {
+            wait_for_file(&root.join(format!("ready-{}", child.id())));
+        }
+        std::fs::write(root.join("go"), b"").unwrap();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("invocations")).unwrap(), "x\n");
+    }
+
+    #[test]
+    fn compiler_output_cache_coalesces_processes() {
+        check_process_coalescing(false);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn async_compiler_output_cache_coalesces_processes() {
+        check_process_coalescing(true);
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn async_compiler_output_cache_cancelled_waiter_releases_runtime() {
+        let directory = coalescing_fixture();
+        let mut child = Command::new(env::current_exe().unwrap())
+            .arg("compiler_output_cache_process_worker")
+            .env("FOUNDRY_CACHE_PROCESS_ROOT", directory.path())
+            .env("FOUNDRY_CACHE_CANCEL_WAITER", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("cancelled cache waiter blocked runtime shutdown");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn compiler_output_cache_recovers_after_owner_process_exits() {
+        let directory = coalescing_fixture();
+        let root = directory.path();
+        let mut child = Command::new(env::current_exe().unwrap())
+            .arg("compiler_output_cache_process_worker")
+            .env("FOUNDRY_CACHE_PROCESS_ROOT", root)
+            .env("FOUNDRY_CACHE_HOLD_LOCK", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_for_file(&root.join(format!("ready-{}", child.id())));
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let solc = coalescing_compiler(root);
+        let input = serde_json::json!({"language": "Solidity", "sources": {}});
+        let (key, _) =
+            solc.compiler_output_cache_key(&serde_json::to_vec(&input).unwrap()).unwrap();
+        let key = key.to_string();
+        let path = root.join("cache").join(&key[..2]).join(format!("{key}.lock"));
+        LocalCompilerOutputCache::new(root.join("cache")).clean();
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        file.try_lock().unwrap();
+        file.unlock().unwrap();
+        let output: serde_json::Value = solc.compile_as(&input).unwrap();
+        assert_eq!(output, serde_json::json!({"contracts": {}}));
+    }
+
+    #[test]
+    #[ignore = "requires Solar in SOLAR_PATH or PATH"]
+    fn compiler_output_cache_solar_output_equality() {
+        let solar = env::var_os("SOLAR_PATH").map(PathBuf::from).unwrap_or_else(|| "solar".into());
+        let uncached = Solc::new(solar).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(LocalCompilerOutputCache::new(directory.path()));
+        let mut cached = uncached.clone();
+        cached.set_compiler_output_cache(cache.clone());
+        let input = serde_json::json!({
+            "language": "Solidity",
+            "sources": {
+                "src/A.sol": {"content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0; import './Math.sol'; contract A { function twice(uint x) external pure returns (uint) { return Math.twice(x); } }"},
+                "src/Math.sol": {"content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0; library Math { function twice(uint x) internal pure returns (uint) { return x * 2; } }"},
+            },
+            "settings": {
+                "optimizer": {"enabled": true, "runs": 200},
+                "evmVersion": "cancun",
+                "outputSelection": {"*": {"*": ["abi", "metadata", "evm.bytecode.object", "evm.bytecode.sourceMap", "evm.deployedBytecode.object", "evm.deployedBytecode.sourceMap"]}},
+            },
+        });
+        let expected: serde_json::Value = uncached.compile_as(&input).unwrap();
+        assert!(
+            expected["errors"]
+                .as_array()
+                .is_none_or(|errors| errors.iter().all(|error| error["severity"] != "error")),
+            "{expected}"
+        );
+        let contract = &expected["contracts"]["src/A.sol"]["A"];
+        for field in [
+            "/metadata",
+            "/evm/bytecode/object",
+            "/evm/bytecode/sourceMap",
+            "/evm/deployedBytecode/object",
+            "/evm/deployedBytecode/sourceMap",
+        ] {
+            assert!(
+                !contract.pointer(field).and_then(serde_json::Value::as_str).unwrap().is_empty(),
+                "{field}"
+            );
+        }
+        let cold: serde_json::Value = cached.compile_as(&input).unwrap();
+        let hit: serde_json::Value = cached.compile_as(&input).unwrap();
+        assert_eq!(cold, expected);
+        assert_eq!(hit, expected);
+        assert_eq!(cache.stats().entry_count, 1);
     }
 }
 

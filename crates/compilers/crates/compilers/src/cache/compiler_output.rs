@@ -160,6 +160,15 @@ pub trait CompilerOutputCache: fmt::Debug + Send + Sync {
 
     /// Invalidates an entry that the compiler could not deserialize.
     fn invalidate(&self, _key: &CompilerOutputCacheKey) {}
+
+    /// Tries to coordinate a cache miss with other invocations of the same compiler input.
+    ///
+    /// The caller must read again after acquiring the guard, and retain it until publication.
+    /// A held lock returns [`std::io::ErrorKind::WouldBlock`], allowing cancellable retries.
+    /// Unsupported backends return `Ok(None)`; other errors should bypass coordination.
+    fn try_acquire(&self, _key: &CompilerOutputCacheKey) -> std::io::Result<Option<Box<dyn Send>>> {
+        Ok(None)
+    }
 }
 
 /// Local filesystem implementation of [`CompilerOutputCache`].
@@ -679,6 +688,45 @@ impl CompilerOutputCache for LocalCompilerOutputCache {
                 key = %key,
             );
         }
+    }
+
+    fn try_acquire(&self, key: &CompilerOutputCacheKey) -> std::io::Result<Option<Box<dyn Send>>> {
+        let path = self.entry_path(key).with_extension("lock");
+        let acquire = || -> std::io::Result<_> {
+            fs::create_dir_all(path.parent().unwrap())?;
+            // Never unlink this file: waiters must always lock the same inode, even after clean.
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            file.try_lock()?;
+            Ok(CompilerOutputCacheLock(file))
+        };
+        match acquire() {
+            Ok(guard) => Ok(Some(Box::new(guard))),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err(error),
+            Err(error) => {
+                trace!(
+                    target: "foundry_compilers::compiler_cache",
+                    outcome = "lock_error",
+                    key = %key,
+                    %error,
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// The OS releases this advisory lock if the process exits without dropping the guard.
+struct CompilerOutputCacheLock(fs::File);
+
+impl Drop for CompilerOutputCacheLock {
+    fn drop(&mut self) {
+        // Explicitly unlock in case a concurrent spawn inherited the descriptor before exec.
+        let _ = self.0.unlock();
     }
 }
 
