@@ -17,7 +17,7 @@ pub mod buildinfo;
 pub mod cache;
 pub use cache::compiler_output::{
     CompilerCachePolicy, CompilerCachePruneReport, CompilerCacheStats, CompilerOutputCache,
-    CompilerOutputCacheKey, LocalCompilerOutputCache,
+    CompilerOutputCacheKey, LocalCompilerOutputCache, SccacheCompilerOutputCache,
 };
 
 pub mod flatten;

@@ -1060,7 +1060,7 @@ impl Solc {
             .as_ref()
             .and_then(|_| self.compiler_output_cache_key(&input));
         if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
-            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
+            && let Some(output) = async_cached_compiler_output(cache, key).await
         {
             return Ok(output);
         }
@@ -1081,7 +1081,7 @@ impl Solc {
             None
         };
         if let Some((cache, (key, _))) = self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
-            && let Some(output) = cached_compiler_output(cache.as_ref(), key)
+            && let Some(output) = async_cached_compiler_output(cache, key).await
         {
             return Ok(output);
         }
@@ -1093,7 +1093,18 @@ impl Solc {
             self.compiler_output_cache.as_ref().zip(cache_key.as_ref())
             && cached_compiler_identity(&self.solc).as_ref() == Some(identity)
         {
-            cache.write(key, &output);
+            if cache.requires_blocking_io() {
+                let cache = Arc::clone(cache);
+                let key = *key;
+                // Retain coordination through publication even if this future is cancelled.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _guard = _guard;
+                    cache.write(&key, &output);
+                })
+                .await;
+            } else {
+                cache.write(key, &output);
+            }
         }
         Ok(parsed)
     }
@@ -1202,7 +1213,34 @@ fn cached_compiler_output<D: DeserializeOwned>(
     key: &CompilerOutputCacheKey,
 ) -> Option<D> {
     let output = cache.read(key)?;
-    match serde_json::from_slice(&output) {
+    deserialize_cached_compiler_output(cache, key, &output)
+}
+
+#[cfg(feature = "async")]
+async fn async_cached_compiler_output<D: DeserializeOwned>(
+    cache: &Arc<dyn CompilerOutputCache>,
+    key: &CompilerOutputCacheKey,
+) -> Option<D> {
+    let output = if cache.requires_blocking_io() {
+        if let Some(output) = cache.read_local(key) {
+            output
+        } else {
+            let cache = Arc::clone(cache);
+            let key = *key;
+            tokio::task::spawn_blocking(move || cache.read(&key)).await.ok().flatten()?
+        }
+    } else {
+        cache.read(key)?
+    };
+    deserialize_cached_compiler_output(cache.as_ref(), key, &output)
+}
+
+fn deserialize_cached_compiler_output<D: DeserializeOwned>(
+    cache: &dyn CompilerOutputCache,
+    key: &CompilerOutputCacheKey,
+    output: &[u8],
+) -> Option<D> {
+    match serde_json::from_slice(output) {
         Ok(output) => Some(output),
         Err(_) => {
             trace!(
@@ -2837,6 +2875,176 @@ fi
         assert_eq!(cold, expected);
         assert_eq!(hit, expected);
         assert_eq!(cache.stats().entry_count, 1);
+    }
+
+    #[cfg(feature = "async")]
+    #[derive(Debug)]
+    struct ControlledExternalCache {
+        local_output: Option<Vec<u8>>,
+        remote_reads: AtomicUsize,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(feature = "async")]
+    impl CompilerOutputCache for ControlledExternalCache {
+        fn read(&self, _key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+            self.remote_reads.fetch_add(1, Ordering::Release);
+            // Bound a regression that accidentally blocks the runtime thread.
+            self.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).ok()?;
+            Some(br#"{"source":"remote"}"#.to_vec())
+        }
+
+        fn write(&self, _key: &CompilerOutputCacheKey, _output: &[u8]) {
+            panic!("a cache hit must not write compiler output");
+        }
+
+        fn requires_blocking_io(&self) -> bool {
+            true
+        }
+
+        fn read_local(&self, _key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+            self.local_output.clone()
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_compiler_output_cache_external_read_keeps_timer_responsive() {
+        let (release, receiver) = std::sync::mpsc::channel();
+        let external = Arc::new(ControlledExternalCache {
+            local_output: None,
+            remote_reads: AtomicUsize::new(0),
+            release: Mutex::new(receiver),
+        });
+        let cache: Arc<dyn CompilerOutputCache> = external.clone();
+        let key = input_cache_key(b"external-read-timer");
+        let read = tokio::spawn(async move {
+            async_cached_compiler_output::<serde_json::Value>(&cache, &key).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while external.remote_reads.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("external cache read did not start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let completed_before_release = read.is_finished();
+        // Release the blocking worker before assertions, including on a failed regression.
+        let _ = release.send(());
+        assert!(!completed_before_release, "external cache read blocked the runtime timer");
+        assert_eq!(read.await.unwrap(), Some(serde_json::json!({ "source": "remote" })));
+        assert_eq!(external.remote_reads.load(Ordering::Acquire), 1);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_compiler_output_cache_warm_local_hit_skips_external_read() {
+        let (_, receiver) = std::sync::mpsc::channel();
+        let external = Arc::new(ControlledExternalCache {
+            local_output: Some(br#"{"source":"local"}"#.to_vec()),
+            remote_reads: AtomicUsize::new(0),
+            release: Mutex::new(receiver),
+        });
+        let cache: Arc<dyn CompilerOutputCache> = external.clone();
+        let key = input_cache_key(b"warm-local-read");
+
+        let output = async_cached_compiler_output::<serde_json::Value>(&cache, &key).await;
+
+        assert_eq!(output, Some(serde_json::json!({ "source": "local" })));
+        assert_eq!(external.remote_reads.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "async")]
+    #[derive(Debug)]
+    struct ControlledExternalWriteCache {
+        local: LocalCompilerOutputCache,
+        writes_started: AtomicUsize,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(feature = "async")]
+    impl CompilerOutputCache for ControlledExternalWriteCache {
+        fn read(&self, key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+            self.local.read(key)
+        }
+
+        fn write(&self, key: &CompilerOutputCacheKey, output: &[u8]) {
+            self.writes_started.fetch_add(1, Ordering::Release);
+            if self.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).is_ok() {
+                self.local.write(key, output);
+            }
+        }
+
+        fn requires_blocking_io(&self) -> bool {
+            true
+        }
+
+        fn read_local(&self, key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+            self.local.read(key)
+        }
+
+        fn try_acquire(&self, key: &CompilerOutputCacheKey) -> io::Result<Option<Box<dyn Send>>> {
+            self.local.try_acquire(key)
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_compiler_output_cache_cancelled_write_retains_coordination() {
+        let directory = coalescing_fixture();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let cache = Arc::new(ControlledExternalWriteCache {
+            local: LocalCompilerOutputCache::new(directory.path().join("cache")),
+            writes_started: AtomicUsize::new(0),
+            release: Mutex::new(receiver),
+        });
+        let mut solc = coalescing_compiler(directory.path());
+        solc.set_compiler_output_cache(cache.clone());
+        let input = serde_json::json!({ "language": "Solidity", "sources": {} });
+        let (key, _) =
+            solc.compiler_output_cache_key(&serde_json::to_vec(&input).unwrap()).unwrap();
+        let compile =
+            tokio::spawn(
+                async move { solc.async_compile_as::<_, serde_json::Value>(&input).await },
+            );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cache.writes_started.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("external cache write did not start");
+        compile.abort();
+        assert!(compile.await.unwrap_err().is_cancelled());
+        let still_locked = matches!(
+            cache.local.try_acquire(&key),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        );
+        let unpublished = cache.local.read(&key).is_none();
+        let _ = release.send(());
+        assert!(still_locked, "cancelled compile released coordination before publication");
+        assert!(unpublished, "controlled write completed before it was released");
+
+        let _guard = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match cache.local.try_acquire(&key) {
+                    Ok(Some(guard)) => break guard,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    _ => panic!("local cache coordination unexpectedly unavailable"),
+                }
+            }
+        })
+        .await
+        .expect("external cache write did not release coordination");
+        let output: serde_json::Value =
+            serde_json::from_slice(&cache.local.read(&key).unwrap()).unwrap();
+        assert_eq!(output, serde_json::json!({ "contracts": {} }));
+        assert_eq!(cache.writes_started.load(Ordering::Acquire), 1);
     }
 }
 

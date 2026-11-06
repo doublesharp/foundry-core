@@ -43,6 +43,8 @@ dyn-clone = "1.0.20"
 derive_more = { version = "2.1.1", features = ["debug"] }
 itertools = ">=0.13, <=0.15"
 fd-lock = "4.0.4"
+zip = { version = "9.0.5", default-features = false }
+zstd = "0.14.3"
 
 # project-util
 fs_extra = { workspace = true, optional = true }
@@ -76,6 +78,7 @@ async = [
     "tokio/process",
     "tokio/io-util",
     "foundry-compilers-artifacts/async",
+    "foundry-compilers-core/async",
 ]
 # Enables `svm` to auto-detect and manage `solc` builds.
 svm-solc = [

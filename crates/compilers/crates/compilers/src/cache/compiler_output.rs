@@ -10,6 +10,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod sccache;
+pub use sccache::SccacheCompilerOutputCache;
+
 const KEY_SCHEMA: &[u8] = b"foundry-compiler-output-cache-v2";
 const ENTRY_MAGIC: &[u8; 8] = b"FOCC\0\0\0\x01";
 const ENTRY_HEADER_LEN: usize = ENTRY_MAGIC.len() + 32 + 32 + 8;
@@ -157,6 +160,16 @@ pub trait CompilerOutputCache: fmt::Debug + Send + Sync {
 
     /// Stores a raw standard-json compiler output.
     fn write(&self, key: &CompilerOutputCacheKey, output: &[u8]);
+
+    /// Whether cache operations may block on an external service.
+    fn requires_blocking_io(&self) -> bool {
+        false
+    }
+
+    /// Performs only the local lookup before an asynchronous caller offloads external I/O.
+    fn read_local(&self, key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+        self.read(key)
+    }
 
     /// Invalidates an entry that the compiler could not deserialize.
     fn invalidate(&self, _key: &CompilerOutputCacheKey) {}

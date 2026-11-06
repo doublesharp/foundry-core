@@ -3452,6 +3452,8 @@ dependencies = [
  "tracing-subscriber",
  "winnow",
  "yansi",
+ "zip",
+ "zstd",
 ]
 
 [[package]]
