@@ -35,6 +35,9 @@ mod command;
 mod compiler;
 pub use compiler::{SOLC_EXTENSIONS, Solc};
 
+#[cfg(feature = "svm-solc")]
+mod solar_release;
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "svm-solc", derive(Default))]
 pub enum SolcCompiler {
