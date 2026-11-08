@@ -926,11 +926,12 @@ fn resolved_import_source_unit(
     remappings: &[CanonicalRemapping<'_>],
 ) -> Option<String> {
     let source_unit = resolve_import_source_unit(source_name, import_path.to_str()?)?;
-    let source_unit = if let Some(remapping) = select_remapping(&source_unit, remappings) {
-        format!("{}{}", remapping.target, &source_unit[remapping.prefix.len()..])
-    } else {
-        source_unit
-    };
+    let source_unit =
+        if let Some(remapping) = select_remapping(source_name, &source_unit, remappings) {
+            format!("{}{}", remapping.target, &source_unit[remapping.prefix.len()..])
+        } else {
+            source_unit
+        };
     is_canonical_source_unit(&source_unit).then_some(source_unit)
 }
 
@@ -965,8 +966,10 @@ fn is_canonical_source_unit(source_unit: &str) -> bool {
         && source_unit.split('/').all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
+/// A remapping in solc's `context:prefix=target` form; an empty context applies to every source.
 #[derive(Clone, Copy)]
 struct CanonicalRemapping<'a> {
+    context: &'a str,
     prefix: &'a str,
     target: &'a str,
 }
@@ -983,28 +986,47 @@ fn canonical_remappings(input: &serde_json::Value) -> Option<Vec<CanonicalRemapp
         .as_array()?
         .iter()
         .map(serde_json::Value::as_str)
-        .map(|remapping| {
-            let (prefix, target) = remapping?.split_once('=')?;
-            is_canonical_remapping_path(prefix)
-                .then_some(CanonicalRemapping { prefix, target })
-                .filter(|_| is_canonical_remapping_path(target))
-        })
+        .map(|remapping| parse_canonical_remapping(remapping?))
         .collect()
+}
+
+/// Parses a remapping like solc's `ImportRemapper::parseRemapping`, which splits at the first `=`
+/// and then at the first `:` before it, and admits only canonical paths.
+fn parse_canonical_remapping(remapping: &str) -> Option<CanonicalRemapping<'_>> {
+    let (context_prefix, target) = remapping.split_once('=')?;
+    let (context, prefix) = context_prefix.split_once(':').unwrap_or(("", context_prefix));
+    (is_canonical_remapping_context(context)
+        && is_canonical_remapping_path(prefix)
+        && is_canonical_remapping_path(target))
+    .then_some(CanonicalRemapping { context, prefix, target })
+}
+
+fn is_canonical_remapping_context(context: &str) -> bool {
+    context.is_empty() || is_canonical_remapping_path(context)
 }
 
 fn is_canonical_remapping_path(path: &str) -> bool {
     is_canonical_source_unit(path) || path.strip_suffix('/').is_some_and(is_canonical_source_unit)
 }
 
+/// Selects the remapping solc's `ImportRemapper::apply` uses for `source_unit` imported from
+/// `importer`.
+///
+/// A remapping applies when its context is a prefix of the importing source unit name and its
+/// prefix is a prefix of the imported source unit name. Among those, solc picks the longest
+/// context, then the longest prefix, and the last listed remapping on ties.
 fn select_remapping<'a>(
+    importer: &str,
     source_unit: &str,
     remappings: &'a [CanonicalRemapping<'a>],
 ) -> Option<CanonicalRemapping<'a>> {
     remappings
         .iter()
         .enumerate()
-        .filter(|(_, remapping)| source_unit.starts_with(remapping.prefix))
-        .max_by_key(|(index, remapping)| (remapping.prefix.len(), *index))
+        .filter(|(_, remapping)| {
+            importer.starts_with(remapping.context) && source_unit.starts_with(remapping.prefix)
+        })
+        .max_by_key(|(index, remapping)| (remapping.context.len(), remapping.prefix.len(), *index))
         .map(|(_, remapping)| *remapping)
 }
 
@@ -2499,7 +2521,7 @@ fi
                     "lib/forge-std/src/Test.sol",
                     &["src/:forge-std/=lib/forge-std/src/"],
                 ),
-                false,
+                true,
             ),
             (
                 "noncanonical remapping target",
@@ -2519,6 +2541,285 @@ fi
             assert_eq!(is_cacheable_compiler_input(&input), expected, "{name}");
             assert_eq!(is_cacheable_compiler_input(&input), expected, "warm {name}");
         }
+    }
+
+    fn closure_input(sources: &[(&str, &str)], remappings: &[&str]) -> Vec<u8> {
+        let sources = sources
+            .iter()
+            .map(|(name, content)| ((*name).to_owned(), serde_json::json!({ "content": content })))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::to_vec(&serde_json::json!({
+            "language": "Solidity",
+            "sources": sources,
+            "settings": { "remappings": remappings },
+        }))
+        .unwrap()
+    }
+
+    fn assert_closure_cases(cases: &[(&str, Vec<u8>, bool)]) {
+        for (name, input, expected) in cases {
+            assert_eq!(uncached_compiler_input(input), *expected, "legacy {name}");
+            assert_eq!(is_cacheable_compiler_input(input), *expected, "{name}");
+            assert_eq!(is_cacheable_compiler_input(input), *expected, "warm {name}");
+        }
+    }
+
+    #[test]
+    fn compiler_output_cache_context_remapping_applies_only_inside_its_context() {
+        let remappings = ["lib/up/:erc4626-tests/=lib/up/lib/erc4626-tests/"].as_slice();
+        assert_closure_cases(&[
+            (
+                "inside context",
+                closure_input(
+                    &[
+                        ("lib/up/test/A.sol", "import 'erc4626-tests/T.sol';"),
+                        ("lib/up/lib/erc4626-tests/T.sol", "contract T {}"),
+                    ],
+                    remappings,
+                ),
+                true,
+            ),
+            (
+                "outside context resolves without remapping",
+                closure_input(
+                    &[
+                        ("src/A.sol", "import 'erc4626-tests/T.sol';"),
+                        ("erc4626-tests/T.sol", "contract T {}"),
+                        ("lib/up/lib/erc4626-tests/T.sol", "contract T {}"),
+                    ],
+                    remappings,
+                ),
+                true,
+            ),
+            (
+                "outside context does not reach the remapped target",
+                closure_input(
+                    &[
+                        ("src/A.sol", "import 'erc4626-tests/T.sol';"),
+                        ("lib/up/lib/erc4626-tests/T.sol", "contract T {}"),
+                    ],
+                    remappings,
+                ),
+                false,
+            ),
+            (
+                "context is a plain string prefix of the importer",
+                closure_input(
+                    &[
+                        ("lib/upgrades/A.sol", "import 'erc4626-tests/T.sol';"),
+                        ("lib/up/lib/erc4626-tests/T.sol", "contract T {}"),
+                    ],
+                    &["lib/up:erc4626-tests/=lib/up/lib/erc4626-tests/"],
+                ),
+                true,
+            ),
+            (
+                "relative import is remapped in the importer context",
+                closure_input(
+                    &[
+                        ("lib/up/src/A.sol", "import '../vendor/T.sol';"),
+                        ("lib/up/lib/vendor/T.sol", "contract T {}"),
+                    ],
+                    &["lib/up/:lib/up/vendor/=lib/up/lib/vendor/"],
+                ),
+                true,
+            ),
+            (
+                "empty context is global",
+                closure_input(
+                    &[("src/A.sol", "import 'oz/T.sol';"), ("lib/oz/T.sol", "contract T {}")],
+                    &[":oz/=lib/oz/"],
+                ),
+                true,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn compiler_output_cache_context_remapping_selection_matches_solc() {
+        let importer = ("lib/up/src/A.sol", "import 'oz/T.sol';");
+        let case = |name, dependency: &str, remappings: &[&str], expected| {
+            (name, closure_input(&[importer, (dependency, "contract T {}")], remappings), expected)
+        };
+        assert_closure_cases(&[
+            case(
+                "context beats a longer global prefix",
+                "lib/up/lib/oz/T.sol",
+                &["oz/T.sol=lib/oz/T.sol", "lib/up/:oz/=lib/up/lib/oz/"],
+                true,
+            ),
+            case(
+                "longer global prefix loses to context",
+                "lib/oz/T.sol",
+                &["oz/T.sol=lib/oz/T.sol", "lib/up/:oz/=lib/up/lib/oz/"],
+                false,
+            ),
+            case(
+                "longest context wins when listed first",
+                "lib/long/T.sol",
+                &["lib/up/src/:oz/=lib/long/", "lib/:oz/=lib/short/"],
+                true,
+            ),
+            case(
+                "longest context wins when listed last",
+                "lib/long/T.sol",
+                &["lib/:oz/=lib/short/", "lib/up/src/:oz/=lib/long/"],
+                true,
+            ),
+            case(
+                "shorter context loses",
+                "lib/short/T.sol",
+                &["lib/:oz/=lib/short/", "lib/up/src/:oz/=lib/long/"],
+                false,
+            ),
+            case(
+                "longest prefix wins within a context",
+                "lib/special/T.sol",
+                &["lib/up/:oz/T.sol=lib/special/T.sol", "lib/up/:oz/=lib/up/lib/oz/"],
+                true,
+            ),
+            case(
+                "last equal context and prefix wins",
+                "lib/last/T.sol",
+                &["lib/up/:oz/=lib/first/", "lib/up/:oz/=lib/last/"],
+                true,
+            ),
+            case(
+                "first equal context and prefix loses",
+                "lib/first/T.sol",
+                &["lib/up/:oz/=lib/first/", "lib/up/:oz/=lib/last/"],
+                false,
+            ),
+            case(
+                "context remapping to a missing source",
+                "lib/oz/T.sol",
+                &["oz/=lib/oz/", "lib/up/:oz/=lib/up/lib/oz/"],
+                false,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn compiler_output_cache_global_and_context_remappings_coexist() {
+        let remappings = ["oz/=lib/oz/", "up/=lib/up/src/", "lib/up/:oz/=lib/up/lib/oz/"];
+        let sources = [
+            ("src/A.sol", "import 'oz/Token.sol'; import 'up/Up.sol';"),
+            ("lib/oz/Token.sol", "contract Token {}"),
+            ("lib/up/src/Up.sol", "import 'oz/Token.sol';"),
+            ("lib/up/lib/oz/Token.sol", "contract UpToken {}"),
+        ];
+        let without = |missing: &str| {
+            sources.iter().copied().filter(|(name, _)| *name != missing).collect::<Vec<_>>()
+        };
+        assert_closure_cases(&[
+            ("closed", closure_input(&sources, &remappings), true),
+            (
+                "missing global target",
+                closure_input(&without("lib/oz/Token.sol"), &remappings),
+                false,
+            ),
+            (
+                "missing context target",
+                closure_input(&without("lib/up/lib/oz/Token.sol"), &remappings),
+                false,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn compiler_output_cache_rejects_malformed_context_remappings() {
+        // Closed whether or not a remapping applies, so only rejecting the remapping bypasses.
+        let sources = [
+            ("lib/up/src/A.sol", "import 'oz/T.sol';"),
+            ("lib/oz/T.sol", "contract T {}"),
+            ("oz/T.sol", "contract T {}"),
+        ];
+        let mut cases =
+            vec![("well formed", closure_input(&sources, &["lib/up/:oz/=lib/oz/"]), true)];
+        for remapping in [
+            "/lib/up/:oz/=lib/oz/",
+            "../lib/up/:oz/=lib/oz/",
+            "lib/../up/:oz/=lib/oz/",
+            "lib/./up/:oz/=lib/oz/",
+            "lib//up/:oz/=lib/oz/",
+            "lib\\up\\:oz/=lib/oz/",
+            "lib/up/:=lib/oz/",
+            "lib/up/:oz:extra/=lib/oz/",
+            "lib/up/:oz/=/lib/oz/",
+            "lib/up/:oz/=lib/oz/../oz/",
+            "lib/up/:oz/=",
+        ] {
+            cases.push((remapping, closure_input(&sources, &[remapping]), false));
+        }
+        assert_closure_cases(&cases);
+    }
+
+    /// Inputs that compile only if the compiler selects the context remapping the cache expects.
+    fn context_remapping_resolution_cases() -> Vec<(&'static str, serde_json::Value)> {
+        let input = |sources: serde_json::Value, remappings: &[&str]| {
+            serde_json::json!({
+                "language": "Solidity",
+                "sources": sources,
+                "settings": { "remappings": remappings },
+            })
+        };
+        vec![
+            (
+                "context_scoped",
+                input(
+                    serde_json::json!({
+                        "src/A.sol": {
+                            "content": "import 'oz/Token.sol'; import 'up/Up.sol'; contract A is Token, Up {}"
+                        },
+                        "lib/oz/Token.sol": { "content": "contract Token {}" },
+                        "lib/up/src/Up.sol": {
+                            "content": "import 'oz/Token.sol'; contract Up is UpToken {}"
+                        },
+                        "lib/up/lib/oz/Token.sol": { "content": "contract UpToken {}" },
+                    }),
+                    &["oz/=lib/oz/", "up/=lib/up/src/", "lib/up/:oz/=lib/up/lib/oz/"],
+                ),
+            ),
+            (
+                "context_beats_longer_prefix",
+                input(
+                    serde_json::json!({
+                        "lib/up/src/Up.sol": {
+                            "content": "import 'oz/Token.sol'; contract Up is Dependency {}"
+                        },
+                        "lib/oz/Token.sol": { "content": "contract Fallback {}" },
+                        "lib/up/lib/oz/Token.sol": { "content": "contract Dependency {}" },
+                    }),
+                    &["lib/up/:oz/=lib/up/lib/oz/", "oz/Token.sol=lib/oz/Token.sol"],
+                ),
+            ),
+            (
+                "longest_context",
+                input(
+                    serde_json::json!({
+                        "lib/up/src/Up.sol": {
+                            "content": "import 'oz/Token.sol'; contract Up is Dependency {}"
+                        },
+                        "lib/long/Token.sol": { "content": "contract Dependency {}" },
+                        "lib/short/Token.sol": { "content": "contract Fallback {}" },
+                    }),
+                    &["lib/up/src/:oz/=lib/long/", "lib/:oz/=lib/short/"],
+                ),
+            ),
+            (
+                "string_prefix_context",
+                input(
+                    serde_json::json!({
+                        "lib/upgrades/A.sol": {
+                            "content": "import 'oz/Token.sol'; contract A is Dependency {}"
+                        },
+                        "oz/Token.sol": { "content": "contract Fallback {}" },
+                        "lib/up/lib/oz/Token.sol": { "content": "contract Dependency {}" },
+                    }),
+                    &["lib/up:oz/=lib/up/lib/oz/"],
+                ),
+            ),
+        ]
     }
 
     #[cfg(feature = "svm-solc")]
@@ -2595,7 +2896,7 @@ fi
             ),
         ];
 
-        for (name, mut input) in cases {
+        for (name, mut input) in cases.into_iter().chain(context_remapping_resolution_cases()) {
             input["settings"]["outputSelection"] = serde_json::json!({ "*": { "*": ["abi"] } });
             let cache_dir = dir.path().join(name);
             let mut solc = solc.clone();
@@ -2884,6 +3185,30 @@ fi
         assert_eq!(cold, expected);
         assert_eq!(hit, expected);
         assert_eq!(cache.stats().entry_count, 1);
+    }
+
+    #[test]
+    #[ignore = "requires Solar in SOLAR_PATH or PATH"]
+    fn compiler_output_cache_solar_context_remappings() {
+        let solar = env::var_os("SOLAR_PATH").map(PathBuf::from).unwrap_or_else(|| "solar".into());
+        let solar = Solc::new(solar).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mut input) in context_remapping_resolution_cases() {
+            input["settings"]["outputSelection"] = serde_json::json!({ "*": { "*": ["abi"] } });
+            let cache = Arc::new(LocalCompilerOutputCache::new(dir.path().join(name)));
+            let mut solar = solar.clone();
+            solar.set_compiler_output_cache(cache.clone());
+            let output: serde_json::Value = solar.compile_as(&input).unwrap();
+            assert!(
+                output["errors"]
+                    .as_array()
+                    .is_none_or(|errors| errors.iter().all(|error| error["severity"] != "error")),
+                "{name}: {output}"
+            );
+            assert_eq!(cache.stats().entry_count, 1, "{name}");
+            let hit: serde_json::Value = solar.compile_as(&input).unwrap();
+            assert_eq!(hit, output, "{name}");
+        }
     }
 
     #[cfg(feature = "async")]

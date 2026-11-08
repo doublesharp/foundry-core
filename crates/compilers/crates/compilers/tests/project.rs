@@ -2,9 +2,10 @@
 
 use alloy_primitives::{Address, Bytes};
 use foundry_compilers::{
-    Artifact, ArtifactFile, ArtifactOutput, ConfigurableArtifacts, ExtraOutputFiles,
-    ExtraOutputValues, Graph, Project, ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig,
-    RestrictionsWithVersion, TestFileFilter, Updates, apply_updates,
+    Artifact, ArtifactFile, ArtifactOutput, CompilerOutputCache, CompilerOutputCacheKey,
+    ConfigurableArtifacts, ExtraOutputFiles, ExtraOutputValues, Graph, LocalCompilerOutputCache,
+    Project, ProjectBuilder, ProjectCompileOutput, ProjectPathsConfig, RestrictionsWithVersion,
+    TestFileFilter, Updates, apply_updates,
     buildinfo::{BuildInfo, SourceEdit},
     cache::{CompilerCache, SOLIDITY_FILES_CACHE_FILENAME},
     compilers::{
@@ -8265,4 +8266,102 @@ fn preprocessor_context_growth_invalidates_out_of_scope_consumers() {
         before.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap(),
         removed.find_first("Consumer").unwrap().get_deployed_bytecode_bytes().unwrap()
     );
+}
+
+/// Counts compiler-output cache hits and publications.
+#[derive(Debug)]
+struct CountingCompilerOutputCache {
+    inner: LocalCompilerOutputCache,
+    hits: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+impl CompilerOutputCache for CountingCompilerOutputCache {
+    fn read(&self, key: &CompilerOutputCacheKey) -> Option<Vec<u8>> {
+        let output = self.inner.read(key);
+        if output.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        output
+    }
+
+    fn write(&self, key: &CompilerOutputCacheKey, output: &[u8]) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.write(key, output);
+    }
+}
+
+// Forge generates `context:prefix=target` remappings for dependencies nested in `lib/`.
+#[test]
+fn compiler_output_cache_reuses_projects_with_context_remappings() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(CountingCompilerOutputCache {
+        inner: LocalCompilerOutputCache::new(cache_dir.path()),
+        hits: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+    });
+    let project = || {
+        let mut project = TempProject::<MultiCompiler>::dapptools().unwrap();
+        project
+            .add_source(
+                "A",
+                r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+import "oz/Token.sol";
+import "up/Up.sol";
+contract A is Token, Up {}
+"#,
+            )
+            .unwrap();
+        project
+            .add_lib(
+                "oz/Token",
+                "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.10;\ncontract Token {}\n",
+            )
+            .unwrap();
+        project
+            .add_lib(
+                "up/src/Up",
+                r#"// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.10;
+import "oz/Token.sol";
+contract Up is UpToken {}
+"#,
+            )
+            .unwrap();
+        project
+            .add_lib(
+                "up/lib/oz/Token",
+                "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.10;\ncontract UpToken {}\n",
+            )
+            .unwrap();
+        let root = project.root().to_path_buf();
+        let path = |dir: &str| format!("{}/", root.join(dir).display());
+        // The graph resolver takes the first applicable remapping, so the context remapping must
+        // precede the global one for the sources to match what solc selects.
+        project.project_mut().paths.remappings = vec![
+            Remapping {
+                context: Some("lib/up/".into()),
+                name: "oz/".into(),
+                path: path("lib/up/lib/oz"),
+            },
+            Remapping { context: None, name: "oz/".into(), path: path("lib/oz") },
+            Remapping { context: None, name: "up/".into(), path: path("lib/up/src") },
+        ];
+        project.project_mut().compiler.set_compiler_output_cache(cache.clone());
+        project
+    };
+
+    let first = project();
+    first.compile().unwrap().assert_success();
+    assert_eq!(cache.writes.load(Ordering::Relaxed), 1, "closed input was not published");
+    assert_eq!(cache.hits.load(Ordering::Relaxed), 0);
+
+    // A fresh checkout of the same project replays the published output.
+    let second = project();
+    let output = second.compile().unwrap();
+    output.assert_success();
+    assert!(output.find_first("A").is_some());
+    assert_eq!(cache.hits.load(Ordering::Relaxed), 1, "fresh project missed the cache");
+    assert_eq!(cache.writes.load(Ordering::Relaxed), 1);
 }
